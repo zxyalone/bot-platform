@@ -79,6 +79,11 @@ export class CodexRuntime implements AgentRuntime {
     }
   }
 
+  async steer(text: string) {
+    if (!this.inTurn || !this.turnId) throw new Error("没有进行中的回合");
+    await this.call("turn/steer", { threadId: this.threadId, expectedTurnId: this.turnId, input: [{ type: "text", text }] });
+  }
+
   async interrupt() {
     if (!this.inTurn || !this.turnId) return;
     this.interrupting = true;
@@ -225,6 +230,7 @@ export class CodexRuntime implements AgentRuntime {
           detail: clip({ command: it.command, cwd: it.cwd }),
           output: done ? clip(it.aggregatedOutput ?? "") : undefined,
           status: done ? (failed ? "failed" : "done") : "running",
+          command: String(it.command ?? "") || undefined,
         });
         return;
       }
@@ -232,7 +238,7 @@ export class CodexRuntime implements AgentRuntime {
         const changes = clip(it.changes);
         this.fileChanges.set(it.id, changes);
         const paths = (it.changes ?? []).map((c: any) => c.path).filter(Boolean);
-        emit({ type: "tool", key: it.id, title: `修改 ${paths.join("、").slice(0, 80) || "文件"}`, detail: changes, status: done ? (it.status === "completed" ? "done" : "failed") : "running" });
+        emit({ type: "tool", key: it.id, title: `修改 ${paths.join("、").slice(0, 80) || "文件"}`, detail: changes, status: done ? (it.status === "completed" ? "done" : "failed") : "running", files: paths.map(String) });
         return;
       }
       case "mcpToolCall":

@@ -75,6 +75,12 @@ export class ClaudeRuntime implements AgentRuntime {
     this.proc?.write({ type: "user", message: { role: "user", content: text } });
   }
 
+  // Claude reads this at its next step and answers within the same turn: one result either way.
+  async steer(text: string) {
+    if (!this.inTurn) throw new Error("没有进行中的回合");
+    this.proc?.write({ type: "user", message: { role: "user", content: text } });
+  }
+
   async interrupt() {
     if (!this.inTurn) return;
     this.interrupting = true;
@@ -147,7 +153,7 @@ export class ClaudeRuntime implements AgentRuntime {
       }
       for (const [i, block] of (m.message?.content ?? []).entries()) {
         if (block.type === "tool_use") {
-          emit({ type: "tool", key: block.id, title: toolTitle(block.name, block.input), detail: toolDetail(block.name, block.input), status: "running" });
+          emit({ type: "tool", key: block.id, title: toolTitle(block.name, block.input), detail: toolDetail(block.name, block.input), status: "running", ...(["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(block.name) && block.input?.file_path ? { files: [String(block.input.file_path)] } : {}), ...(block.name === "Bash" && block.input?.command ? { command: String(block.input.command) } : {}) });
         } else if (block.type === "text" && !this.streamed.has(id)) {
           emit({ type: "text_done", key: `${id}:${i}`, text: block.text });
         }

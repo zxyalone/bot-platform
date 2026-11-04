@@ -58,7 +58,7 @@ export interface Item {
   conv_id: string;
   turn_id: string | null;
   seq?: number;
-  type: "user" | "assistant" | "tool" | "approval" | "error" | "turn_summary" | "call" | "job" | "notice";
+  type: "user" | "assistant" | "tool" | "approval" | "error" | "turn_summary" | "call" | "job" | "notice" | "queued" | "result";
   status: string;
   data: Record<string, unknown>;
   created_at: number;
@@ -70,7 +70,7 @@ export type AgentEvent =
   | { type: "session"; sessionId: string }
   | { type: "text_delta"; key: string; text: string }
   | { type: "text_done"; key: string; text: string }
-  | { type: "tool"; key: string; title: string; detail?: string; output?: string; status: "running" | "done" | "failed" }
+  | { type: "tool"; key: string; title: string; detail?: string; output?: string; status: "running" | "done" | "failed"; files?: string[]; command?: string }
   | { type: "approval"; requestId: string; title: string; detail: string; canRemember: boolean }
   | { type: "approval_cancelled"; requestId: string }
   | { type: "usage_tick"; tokens: number }
@@ -94,6 +94,8 @@ export interface RuntimeOptions {
 export interface AgentRuntime {
   start(): Promise<void>;
   send(text: string): Promise<void>;
+  // Adds to the turn in progress. Agents without it get the message after the turn ends.
+  steer?(text: string): Promise<void>;
   interrupt(): Promise<void>;
   answerApproval(requestId: string, decision: ApprovalDecision): void;
   stop(): void;

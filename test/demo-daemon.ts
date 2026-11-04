@@ -31,6 +31,7 @@ class Scripted implements AgentRuntime {
   readonly o: RuntimeOptions;
   private approve: ((d: ApprovalDecision) => void) | null = null;
   private stopped = false;
+  private readonly steers: string[] = [];
   constructor(o: RuntimeOptions) {
     this.o = o;
   }
@@ -46,6 +47,9 @@ class Scripted implements AgentRuntime {
     }
     this.o.onEvent({ type: "text_done", key, text });
   }
+  async steer(text: string) {
+    this.steers.push(text);
+  }
   async send(prompt: string) {
     this.stopped = false;
     void this.run(prompt);
@@ -55,7 +59,18 @@ class Scripted implements AgentRuntime {
     e({ type: "usage_tick", tokens: 2500 });
     const name = this.o.systemPrompt.match(/DEMO:(\w+)/)?.[1];
     if (name === "Chief") {
-      if (/派任务/.test(prompt)) {
+      if (/改文件/.test(prompt)) {
+        await this.stream("我来改两个文件，再跑一次测试。这段时间可以试试排队或立即补充。");
+        const file = join(this.o.cwd, "boundary_loss.py");
+        e({ type: "tool", key: "edit", title: "写入 boundary_loss.py", status: "running", files: [file] });
+        await wait(1500);
+        writeFileSync(file, `def boundary_loss(pred, target):\n    return ${Math.random()}\n`);
+        e({ type: "tool", key: "edit", title: "", status: "done" });
+        e({ type: "tool", key: "test", title: "运行命令：npm test", status: "running", command: "npm test" });
+        await wait(this.steers.length ? 300 : 5000);
+        e({ type: "tool", key: "test", title: "", output: "3 passed", status: "done" });
+        await this.stream(`改好了，测试通过。${this.steers.length ? `也按你的补充处理了：${this.steers.splice(0).join("；")}` : ""}`);
+      } else if (/派任务/.test(prompt)) {
         await this.stream("我拆成三个后台任务：Reviewer 先审，Engineer 等审查结论再改，Scout 查资料限时 3 秒。");
         const task = async (args: object) => JSON.parse((await bus(this.o, "assign_task", args)).text).task_id;
         const review = await task({ bot: "Reviewer", task: "后台审查 boundary_loss.py，重点看类别不平衡。" });

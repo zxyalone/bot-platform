@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { agentEnv } from "./adapters/process.ts";
 import { HttpError } from "./errors.ts";
@@ -13,6 +13,61 @@ export function git(cwd: string, args: string[], env: Record<string, string> = {
       else resolve(stdout);
     });
   });
+}
+
+// What a directory looks like now, so a round can report what actually changed instead of what a model says changed.
+// Files are compared by size and time rather than content, because an untracked dataset may be huge.
+export interface WorkState {
+  top: string;
+  head: string | null;
+  files: Map<string, string>;
+}
+export type ChangedFile = { path: string; change: "新增" | "修改" | "删除" | "还原" };
+const MAX_WATCHED = 5000;
+
+export async function workState(cwd: string): Promise<WorkState | null> {
+  try {
+    const top = (await git(cwd, ["rev-parse", "--show-toplevel"])).trim();
+    const head = await git(top, ["rev-parse", "HEAD"]).then((h) => h.trim(), () => null);
+    const parts = (await git(top, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).split("\0");
+    const files = new Map<string, string>();
+    for (let i = 0; i < parts.length && files.size < MAX_WATCHED; i++) {
+      if (parts[i].length < 4) continue;
+      const code = parts[i].slice(0, 2);
+      const path = parts[i].slice(3);
+      if (code.includes("R") || code.includes("C")) i++; // The original name follows.
+      let stamp = "gone";
+      try {
+        const st = lstatSync(join(top, path));
+        stamp = `${st.size}:${st.mtimeMs}`;
+      } catch {}
+      files.set(path, `${code} ${stamp}`);
+    }
+    return { top, head, files };
+  } catch {
+    return null;
+  }
+}
+
+export async function changedSince(before: WorkState) {
+  const after = await workState(before.top);
+  if (!after) return null;
+  const found = new Map<string, ChangedFile["change"]>();
+  let commits = 0;
+  if (before.head && after.head && before.head !== after.head) {
+    commits = Number((await git(before.top, ["rev-list", "--count", `${before.head}..${after.head}`]).catch(() => "0")).trim());
+    const moved = (await git(before.top, ["diff", "--no-renames", "--name-status", "-z", before.head, after.head]).catch(() => "")).split("\0");
+    for (let i = 0; i + 1 < moved.length; i += 2) found.set(moved[i + 1], moved[i] === "A" ? "新增" : moved[i] === "D" ? "删除" : "修改");
+  }
+  for (const [path, now] of after.files) {
+    if (before.files.get(path) === now) continue;
+    const code = now.slice(0, 2);
+    found.set(path, code === "??" || code.includes("A") ? "新增" : code.includes("D") ? "删除" : "修改");
+  }
+  // Dirty before and clean now, with no commit to explain it: someone put it back.
+  for (const path of before.files.keys()) if (!after.files.has(path) && !found.has(path)) found.set(path, "还原");
+  const files = [...found].map(([path, change]) => ({ path, change }));
+  return { files, commits };
 }
 
 const MEMORY_FILE = "MEMORY.md";

@@ -41,6 +41,12 @@ export function acpLaunch(o: RuntimeOptions): AcpLaunch {
   return { command: "agy", args: ["acp"], modelId: `${o.model}-${o.effort}` };
 }
 
+// Only agents that state a tool's kind can say that it edits files or runs a command.
+const toolFacts = (u: any) => {
+  const files = [...(u.locations ?? []).map((l: any) => l?.path), u.rawInput?.file_path, u.rawInput?.path].filter((p) => typeof p === "string");
+  return { ...(u.kind === "edit" && files.length ? { files } : {}), ...(u.kind === "execute" && typeof u.rawInput?.command === "string" ? { command: u.rawInput.command } : {}) };
+};
+
 export class AcpRuntime implements AgentRuntime {
   private proc: LineProcess | null = null;
   private readonly opts: RuntimeOptions;
@@ -246,7 +252,7 @@ export class AcpRuntime implements AgentRuntime {
         return;
       case "tool_call":
         this.closeSegment();
-        emit({ type: "tool", key: u.toolCallId, title: String(u.title ?? "工具调用").slice(0, 160), detail: clip(u.rawInput), status: u.status === "failed" ? "failed" : u.status === "completed" ? "done" : "running" });
+        emit({ type: "tool", key: u.toolCallId, title: String(u.title ?? "工具调用").slice(0, 160), detail: clip(u.rawInput), status: u.status === "failed" ? "failed" : u.status === "completed" ? "done" : "running", ...toolFacts(u) });
         return;
       case "tool_call_update": {
         const status = u.status === "failed" ? "failed" : u.status === "completed" ? "done" : "running";

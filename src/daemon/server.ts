@@ -6,7 +6,7 @@ import { readQuotas, type QuotaReport } from "./quota.ts";
 import { refineRole, type RefineInput } from "./refine.ts";
 import { CHIEF_ROLE, SETTING_DEFAULTS, type AppSettings } from "./store.ts";
 import { isAbsolute, join } from "node:path";
-import { Engine, HttpError } from "./engine.ts";
+import { Engine, HttpError, STEERABLE } from "./engine.ts";
 import { Memory, type MemoryScope } from "./git.ts";
 import { agentEnv } from "./adapters/process.ts";
 import type { Store } from "./store.ts";
@@ -250,7 +250,7 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
     }
     if (parts[0] !== "api") throw new HttpError(404, "Not found");
 
-    if (m === "GET" && pathname === "/api/state") return json(res, 200, { settings: o.store.settings(), bots: o.store.listBots().map(botView), groups: o.store.listGroups().map(groupView), agents: await status(), chief_default_role: CHIEF_ROLE });
+    if (m === "GET" && pathname === "/api/state") return json(res, 200, { steerable: STEERABLE, settings: o.store.settings(), bots: o.store.listBots().map(botView), groups: o.store.listGroups().map(groupView), agents: await status(), chief_default_role: CHIEF_ROLE });
     if (pathname === "/api/settings") {
       if (m === "GET") return json(res, 200, { settings: o.store.settings(), home: o.store.home });
       if (m === "PUT") {
@@ -337,10 +337,16 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       if (m === "GET" && parts[3] === "items") {
         const conv = o.store.getConversation(parts[2]);
         if (!conv) throw new HttpError(404, "对话不存在");
-        return json(res, 200, { conversation: conv, items: o.store.listItems(conv.id) });
+        return json(res, 200, { conversation: conv, items: o.store.listItems(conv.id), activity: engine.activity(conv.id) });
       }
       if (m === "GET" && parts[3] === "worktrees") return json(res, 200, { worktrees: o.store.listWorktrees(parts[2]).filter((w) => w.status === "active") });
       if (m === "GET" && parts[3] === "trace") return json(res, 200, engine.trace(parts[2]));
+      if (m === "POST" && parts[3] === "followup") {
+        const body = await readJson(req);
+        if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "消息不能为空");
+        if (body.text.length > MAX_MESSAGE) throw new HttpError(413, "消息太长");
+        return json(res, 202, await engine.followUp(parts[2], body.text, body.mode === "steer" ? "steer" : "queue"));
+      }
       if (m === "POST" && parts[3] === "interrupt") {
         await readJson(req);
         await engine.interrupt(parts[2]);
@@ -350,6 +356,17 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
         engine.archiveConversation(parts[2]);
         return json(res, 200, { ok: true });
       }
+    }
+    if (parts[1] === "items" && parts[2]) {
+      if (m === "POST" && parts[3] === "withdraw") {
+        await readJson(req);
+        return json(res, 200, engine.withdrawQueued(parts[2]));
+      }
+      if (m === "POST" && parts[3] === "accept") {
+        await readJson(req);
+        return json(res, 200, engine.acceptResult(parts[2]));
+      }
+      if (m === "GET" && parts[3] === "diff") return json(res, 200, await engine.resultDiff(parts[2]));
     }
     if (m === "POST" && parts[1] === "approvals" && parts[2]) {
       const { decision, spec } = await readJson(req);

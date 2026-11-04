@@ -447,6 +447,7 @@ export class Store {
     this.db.prepare("UPDATE calls SET status='interrupted', reason=?, answer=COALESCE(answer, ?), ended_at=? WHERE status IN ('running','waiting')").run(reason, reason, now);
     this.db.prepare("UPDATE items SET status='interrupted', data=json_set(data, '$.answer', ?), updated_at=? WHERE type='call' AND status IN ('running','waiting')").run(reason, now);
     this.db.prepare("UPDATE root_turns SET status='interrupted' WHERE status='running'").run();
+    this.db.prepare("UPDATE items SET status='unsent', data=json_set(data, '$.reason', ?), updated_at=? WHERE type='queued' AND status='queued'").run("守护进程重启了，这条没有发出", now);
     const visible = (this.db.prepare("SELECT id FROM conversations WHERE kind IN ('direct','group')").all() as Row[]).map((r) => r.id as string);
     return stuck.filter((id) => visible.includes(id));
   }

@@ -188,9 +188,10 @@ async function loadItems() {
   }
   const target = state.convId;
   try {
-    const [{ items }, trace, { worktrees }] = await Promise.all([api(`/api/conversations/${target}/items`), api(`/api/conversations/${target}/trace`), api(`/api/conversations/${target}/worktrees`)]);
+    const [{ items, activity }, trace, { worktrees }] = await Promise.all([api(`/api/conversations/${target}/items`), api(`/api/conversations/${target}/trace`), api(`/api/conversations/${target}/worktrees`)]);
     if (state.convId !== target) return;
     state.items = items;
+    state.activity = activity;
     state.trace = trace;
     state.worktrees = worktrees;
     state.loadError = null;
@@ -255,6 +256,12 @@ function handleEvent(ev) {
         state.items.push(ev.item);
         appendItemNode(ev.item);
       }
+      return;
+    }
+    case "activity": {
+      if (ev.convId !== state.convId) return;
+      state.activity = ev.activity;
+      renderActivity();
       return;
     }
     case "budget": {
@@ -398,6 +405,7 @@ async function refreshAll() {
     state.groups = s.groups;
     state.agents = s.agents;
     state.chiefDefaultRole = s.chief_default_role;
+    state.steerable = s.steerable ?? [];
     applyAppearance(s.settings);
     restartQuotaTimer();
     state.loadError = null;
@@ -447,6 +455,39 @@ async function send() {
   state.sending = false;
   renderComposerState();
   box.focus();
+}
+
+// While a round runs, a message waits for it to end, or joins it if the agent can take that.
+async function followUp(mode) {
+  const box = $("composer-input");
+  const text = box.value;
+  if (!text.trim() || !state.convId || state.sending) return;
+  state.sending = true;
+  state.sendError = null;
+  renderComposerState();
+  try {
+    const r = await api(`/api/conversations/${state.convId}/followup`, { method: "POST", body: { text, mode } });
+    state.drafts.delete(draftKey());
+    box.value = "";
+    autoGrow(box);
+    if (mode === "steer" && r.delivered === "queued") state.sendError = "这一步无法中途补充，已改为排队，这一轮结束后发出。";
+  } catch (e) {
+    state.sendError = e.message;
+  }
+  state.sending = false;
+  renderComposerState();
+  box.focus();
+}
+
+async function withdrawQueued(item) {
+  try {
+    const { text } = await api(`/api/items/${item.id}/withdraw`, { method: "POST", body: {} });
+    const box = $("composer-input");
+    fillComposer(box.value.trim() ? `${box.value}\n${text}` : text);
+  } catch (e) {
+    state.sendError = e.message;
+    renderComposerState();
+  }
 }
 
 async function stopTurn() {
@@ -842,6 +883,7 @@ function renderComposer(entity) {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
         e.preventDefault();
         if (currentConv()?.status !== "running") send();
+        else followUp(canSteer() && (e.metaKey || e.ctrlKey) ? "steer" : "queue");
       }
     },
   });
@@ -852,9 +894,18 @@ function renderComposer(entity) {
     "div",
     { class: "composer-wrap" },
     h("p", { id: "send-error", class: "send-error", role: "alert", hidden: true }),
+    h("div", { id: "activity-bar", class: "activity-bar", role: "status", hidden: true }),
+    h("div", { id: "queue-strip", class: "queue-strip", hidden: true }),
     h("div", { id: "mention-popup", class: "mention-popup", role: "listbox", hidden: true }),
-    h("div", { class: "composer" }, box, h("button", { id: "send-btn", class: "send-btn", type: "button" })),
-    h("p", { class: "composer-hint" }, "Enter 发送，Shift + Enter 换行"),
+    h(
+      "div",
+      { class: "composer" },
+      box,
+      h("button", { id: "steer-btn", class: "steer-btn", type: "button", hidden: true, title: "把这条消息补充进正在进行的这一轮", onclick: () => followUp("steer") }, "立即补充"),
+      h("button", { id: "stop-btn", class: "send-btn stop", type: "button", hidden: true, title: "停止回复", "aria-label": "停止回复", onclick: stopTurn }, icon("stop", 17)),
+      h("button", { id: "send-btn", class: "send-btn", type: "button" }),
+    ),
+    h("p", { id: "composer-hint", class: "composer-hint" }),
   );
 }
 
@@ -875,12 +926,20 @@ function renderComposerState() {
   const bot = currentBot();
   const running = conv?.status === "running";
   const blocked = conv && bot && !currentGroup() && conv.agent !== bot.agent;
-  btn.replaceChildren(icon(running ? "stop" : "send", 17));
-  btn.classList.toggle("stop", running);
-  btn.setAttribute("aria-label", running ? "停止回复" : "发送");
-  btn.title = running ? "停止回复" : "发送";
-  btn.onclick = running ? stopTurn : send;
+  const label = running ? "排队发送" : "发送";
+  btn.replaceChildren(icon("send", 17));
+  btn.setAttribute("aria-label", label);
+  btn.title = label;
+  btn.onclick = running ? () => followUp("queue") : send;
   btn.disabled = state.sending || Boolean(blocked);
+  $("stop-btn").hidden = !running;
+  const steer = $("steer-btn");
+  steer.hidden = !(running && canSteer());
+  steer.disabled = state.sending;
+  const hint = $("composer-hint");
+  if (hint) hint.textContent = !running ? "Enter 发送，Shift + Enter 换行" : canSteer() ? "Enter 排队，这一轮结束后发出；⌘/Ctrl + Enter 立即补充" : "Enter 排队，这一轮结束后发出。这个 agent 或群聊不能中途补充";
+  renderQueue();
+  renderActivity();
   const box = $("composer-input");
   if (box) box.disabled = Boolean(blocked);
   const err = $("send-error");
@@ -888,16 +947,110 @@ function renderComposerState() {
     err.hidden = !state.sendError;
     err.textContent = state.sendError ?? "";
   }
-  const log = $("timeline");
-  const thinking = log?.querySelector(".thinking");
-  const last = state.items[state.items.length - 1];
-  const showThinking = running && (!last || !(last.type === "assistant" && last.status === "streaming") && !(last.type === "approval" && last.status === "pending"));
-  if (log) {
-    if (showThinking && !thinking) {
-      log.append(h("div", { class: "thinking", role: "status" }, h("span", { class: "dot" }), h("span", { class: "dot" }), h("span", { class: "dot" }), h("span", { class: "sr-only" }, "正在处理")));
-      stickToBottom(log, true);
-    } else if (!showThinking && thinking) thinking.remove();
-    else if (showThinking && thinking) log.append(thinking);
+}
+
+const canSteer = () => !currentGroup() && (state.steerable ?? []).includes(currentConv()?.agent);
+
+function renderQueue() {
+  const strip = $("queue-strip");
+  if (!strip) return;
+  const list = state.items.filter((i) => i.type === "queued" && (i.status === "queued" || i.status === "unsent"));
+  strip.hidden = !list.length;
+  strip.replaceChildren(
+    ...list.map((i) =>
+      h(
+        "div",
+        { class: `queued-row ${i.status}` },
+        h("span", { class: "chip" }, i.status === "queued" ? "排队中" : "没有发出"),
+        h("span", { class: "queued-text", title: i.data.reason ?? i.data.text }, i.data.text),
+        h("button", { type: "button", onclick: () => withdrawQueued(i) }, i.status === "queued" ? "撤回" : "放回输入框"),
+      ),
+    ),
+  );
+}
+
+const STALE_MS = 120000;
+const sinceLabel = (ms) => (ms < 5000 ? "刚刚有更新" : ms < 60000 ? `${Math.round(ms / 1000)} 秒前有更新` : `${Math.round(ms / 60000)} 分钟前有更新`);
+
+function renderActivity() {
+  const bar = $("activity-bar");
+  if (!bar) return;
+  const running = currentConv()?.status === "running";
+  bar.hidden = !running;
+  clearTimeout(state.activityTimer);
+  if (!running) return;
+  const a = state.activity ?? { kind: "working", text: "正在处理", at: Date.now() };
+  const idle = Date.now() - a.at;
+  // Waiting for a person is not being stuck.
+  const stale = idle > STALE_MS && a.kind !== "approval" && a.kind !== "waiting";
+  bar.className = `activity-bar ${a.kind}${stale ? " stale" : ""}`;
+  bar.replaceChildren(h("span", { class: "status-dot small" }), h("span", { class: "activity-text" }, a.text), h("span", { class: "activity-time" }, sinceLabel(idle)));
+  if (stale) bar.append(h("span", { class: "activity-stale" }, "很久没有新动静了，可能还在长时间执行，也可能卡住了。可以再等等，或者点停止。"));
+  state.activityTimer = setTimeout(renderActivity, 5000);
+}
+
+function resultNode(item, attrs) {
+  const d = item.data;
+  const ended = { completed: "这一轮完成了", failed: "这一轮失败了", interrupted: "这一轮被停止了", over_budget: "这一轮预算用完了" }[item.status] ?? "这一轮结束了";
+  const shown = d.files.slice(0, 8);
+  const passed = d.checks.filter((c) => c.status === "done").length;
+  const failed = d.checks.length - passed;
+  const source = d.source === "git" ? "平台用 Git 检查，这一轮期间目录里的变化" : "Bot 的工具上报，平台没有在 Git 里看到这些改动";
+  return h(
+    "div",
+    { ...attrs, class: `result-card ${item.status}` },
+    h("div", { class: "result-head" }, h("strong", {}, ended), d.accepted ? h("span", { class: "chip" }, "你已接受") : null),
+    d.summary ? h("p", { class: "result-summary" }, h("span", { class: "muted" }, "Bot 自述："), d.summary) : null,
+    d.files.length
+      ? h(
+          "div",
+          { class: "result-section" },
+          h("p", { class: "call-label" }, `改动 ${d.total} 个文件${d.commits ? `，${d.commits} 个新提交` : ""}（${source}）`),
+          h("ul", { class: "result-files" }, shown.map((f) => h("li", {}, h("span", { class: "chip" }, f.change), h("span", { class: "path" }, f.path)))),
+          d.total > shown.length ? h("p", { class: "muted small" }, `还有 ${d.total - shown.length} 个文件`) : null,
+        )
+      : null,
+    d.worktrees.length ? h("div", { class: "result-section" }, h("p", { class: "call-label" }, "工作树（在右侧面板合并或丢弃）"), h("ul", { class: "result-files" }, d.worktrees.map((w) => h("li", {}, h("span", { class: "path" }, `${w.bot} · ${w.branch}`), h("span", { class: "muted small" }, w.changes.replace(/^实际改动：\n?/, "").split("\n")[0]))))) : null,
+    h(
+      "div",
+      { class: "result-section" },
+      h("p", { class: "call-label" }, "验证"),
+      d.checks.length
+        ? h("p", { class: failed ? "result-failed" : "small" }, `平台记录到 ${d.checks.length} 条检查命令：${passed} 条成功${failed ? `，${failed} 条失败` : ""}。`, h("span", { class: "muted" }, ` ${d.checks.map((c) => c.command).slice(0, 3).join("；")}`))
+        : h("p", { class: "muted small" }, "平台没有记录到测试或检查命令。Bot 说验证过的，请自己确认。"),
+    ),
+    h(
+      "div",
+      { class: "approval-actions" },
+      d.repo ? h("button", { type: "button", onclick: () => openResultDiff(item) }, "查看改动") : null,
+      h("button", { type: "button", onclick: () => fillComposer("请继续修改：") }, "继续修改"),
+      d.accepted ? null : h("button", { type: "button", class: "primary", title: "只记下你看过并接受了，不会合并或提交任何东西", onclick: () => acceptResult(item) }, "接受结果"),
+    ),
+  );
+}
+
+async function acceptResult(item) {
+  try {
+    await api(`/api/items/${item.id}/accept`, { method: "POST", body: {} });
+  } catch (e) {
+    state.sendError = e.message;
+    renderComposerState();
+  }
+}
+
+async function openResultDiff(item) {
+  const dlg = $("bot-dialog");
+  const body = h("pre", { class: "diff-view" }, "读取中…");
+  dlg.replaceChildren(h("div", {}, h("h2", {}, "这一轮的改动"), h("p", { class: "muted small" }, "相对这一轮开始时的提交。这些文件在这一轮之前已有的未提交改动也会显示。"), body, h("div", { class: "dialog-actions" }, h("span", { class: "spacer" }), h("button", { type: "button", onclick: () => dlg.close() }, "关闭"))));
+  dlg.showModal();
+  try {
+    const d = await api(`/api/items/${item.id}/diff`);
+    const extra = d.untracked.length ? `\n新文件：\n${d.untracked.map((f) => `  ${f}`).join("\n")}\n` : "";
+    body.textContent = (d.diff + extra).trim() || "现在已经没有差异了，这些改动可能又被改回去了。";
+    if (d.clipped) body.textContent += "\n\n…（改动太长，已截断）";
+    if (d.clippedFiles) body.textContent += "\n\n…（文件太多，只比较了前面一部分）";
+  } catch (e) {
+    body.textContent = e.message;
   }
 }
 
@@ -972,7 +1125,9 @@ function itemNode(item) {
   const attrs = { "data-item": item.id };
   switch (item.type) {
     case "user":
-      return h("div", { ...attrs, class: "msg user" }, h("div", { class: "bubble" }, d.text));
+      return h("div", { ...attrs, class: "msg user" }, d.steered ? h("span", { class: "chip" }, "运行中补充") : null, h("div", { class: "bubble" }, d.text));
+    case "result":
+      return resultNode(item, attrs);
     case "assistant": {
       const body = h("div", { class: "md" });
       body.innerHTML = renderMarkdown(d.text); // Output of the escaping renderer in markdown.js.

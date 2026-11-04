@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BUS_TOOLS, CHIEF_TOOLS, MODELS, RESEARCH_TOOLS, type AgentEvent, type AgentKind, type AgentRuntime, type ApprovalDecision, type Bot, type Conversation, type Group, type Item, type RuntimeFactory, type TurnStatus } from "./types.ts";
 import { HttpError } from "./errors.ts";
-import { Memory, Worktrees, type MemoryScope, type Worktree } from "./git.ts";
+import { Memory, Worktrees, type MemoryScope, type Worktree, changedSince, git, workState, type WorkState } from "./git.ts";
 import { Research } from "./research.ts";
 import type { Store } from "./store.ts";
 
@@ -16,6 +16,14 @@ const BUS_SHIM = join(dirname(fileURLToPath(import.meta.url)), "bus-mcp.mjs");
 export { HttpError };
 
 const MAX_BOTS = 12;
+export const STEERABLE: AgentKind[] = ["claude", "codex"];
+const MAX_QUEUED = 10;
+const ACTIVITY_MS = 300;
+const BASELINE_WAIT_MS = 2000;
+const MAX_RESULT_FILES = 100;
+const MAX_RESULT_DIFF = 400_000;
+// What a person would accept as "it was checked". A match says only that the command ran and how it exited.
+const CHECK_COMMAND = /(^|[\s;&|/])(pytest|tox|ctest|vitest|jest|mypy|ruff|eslint|tsc|unittest|(npm|pnpm|yarn)( run)? (test|lint|check)\S*|node --test|cargo (test|check|clippy)|go (test|vet)|(mvn|gradle) test|make (test|check))(\s|$)/;
 const PROPOSAL_FIELDS = ["name", "role", "agent", "model", "effort", "permission", "budget_tokens"];
 const PERMISSION_TEXT: Record<string, string> = { ask: "每次询问", auto_edit: "自动改文件（工作目录）", read_only: "只读" };
 const pick = (o: any) => Object.fromEntries(PROPOSAL_FIELDS.filter((k) => o?.[k] !== undefined).map((k) => [k, o[k]]));
@@ -34,6 +42,13 @@ interface RootTurn {
   // Why it was stopped. The first cause wins: stopping the main turn also closes the round.
   stopNote: string | null;
   tasks: Map<string, TaskRun>;
+  baseline: Promise<WorkState | null>;
+  startedAt: number;
+  lastActivity: number;
+  activityTimer: NodeJS.Timeout | null;
+  files: Set<string>;
+  checks: { command: string; status: string }[];
+  lastText: string;
 }
 
 interface TurnCtx {
@@ -110,6 +125,9 @@ interface Live {
   approvals: Map<string, string>;
   usage: { inputTokens: number; cachedTokens: number; outputTokens: number; costUsd: number | null } | null;
   interruptTimer: NodeJS.Timeout | null;
+  files: Set<string>;
+  // Set after a steer: a message that arrived just too late is answered after the turn it was meant for.
+  lateConv: string | null;
 }
 
 export type Broadcast = (event: { type: string; [k: string]: unknown }) => void;
@@ -143,6 +161,7 @@ export class Engine {
   private readonly store: Store;
   private readonly factory: RuntimeFactory;
   private readonly broadcast: Broadcast;
+  private readonly publish: Broadcast;
   private readonly fixedIdleMs: number | undefined;
   private readonly busUrl: () => string;
   private readonly validateBot: (input: any, existing?: Bot) => Promise<any>;
@@ -151,6 +170,7 @@ export class Engine {
   readonly research: Research;
   private readonly pendingWakes = new Map<string, string[]>();
   private memoryEpoch = 0;
+  private closed = false;
   private readonly proposals = new Map<string, { live: Live; resolve: (r: { decision: ApprovalDecision | "expired"; spec?: any }) => void }>();
   private readonly live = new Map<string, Live>();
   private readonly busTokens = new Map<string, Live>();
@@ -161,7 +181,13 @@ export class Engine {
   constructor(o: { store: Store; factory: RuntimeFactory; broadcast: Broadcast; idleMs?: number; busUrl: () => string; validateBot: (input: any, existing?: Bot) => Promise<any>; pollMs?: number; sshPollMs?: number }) {
     this.store = o.store;
     this.factory = o.factory;
-    this.broadcast = o.broadcast;
+    this.publish = o.broadcast;
+    this.broadcast = (e) => {
+      o.broadcast(e);
+      const convId = e.type === "item" ? (e.item as Item).conv_id : e.type === "delta" || e.type === "trace" ? (e.convId as string) : null;
+      const root = convId ? this.roots.get(convId) : undefined;
+      if (root) this.touch(root);
+    };
     this.busUrl = o.busUrl;
     this.validateBot = o.validateBot;
     this.memory = new Memory(o.store.home);
@@ -176,10 +202,13 @@ export class Engine {
   }
 
   shutdown() {
+    this.closed = true;
     clearInterval(this.reaper);
     // Running jobs are detached on purpose: they keep going and are picked up after the restart.
     this.research.stop();
     for (const root of this.roots.values()) {
+      if (root.activityTimer) clearTimeout(root.activityTimer);
+      root.activityTimer = null;
       for (const t of root.tasks.values()) {
         if (t.clock) clearInterval(t.clock);
         if (t.forceTimer) clearTimeout(t.forceTimer);
@@ -215,26 +244,181 @@ export class Engine {
   }
 
   private openRoot(convId: string, limit: number): RootTurn {
-    const root: RootTurn = { id: randomUUID(), convId, limit, spent: 0, callCount: 0, activeCalls: 0, active: new Set(), stopping: false, overBudget: false, stopNote: null, tasks: new Map() };
+    const now = Date.now();
+    const root: RootTurn = { id: randomUUID(), convId, limit, spent: 0, callCount: 0, activeCalls: 0, active: new Set(), stopping: false, overBudget: false, stopNote: null, tasks: new Map(), baseline: workState(this.store.getConversation(convId)!.cwd), startedAt: now, lastActivity: now, activityTimer: null, files: new Set(), checks: [], lastText: "" };
     this.roots.set(convId, root);
     this.store.createRootTurn(root.id, convId, limit);
     this.broadcastBudget(root, true);
+    this.touch(root);
     return root;
+  }
+
+  // ---------- what a round is doing right now ----------
+  private touch(root: RootTurn) {
+    root.lastActivity = Date.now();
+    if (root.activityTimer) return;
+    root.activityTimer = setTimeout(() => {
+      root.activityTimer = null;
+      if (this.roots.get(root.convId) === root) this.publish({ type: "activity", convId: root.convId, activity: this.activity(root.convId) });
+    }, ACTIVITY_MS);
+    root.activityTimer.unref();
+  }
+
+  private describeLive(l: Live) {
+    const who = l.ctx?.speaker ? `${l.bot.name} ` : "";
+    const tools = [...l.toolItems.values()].filter(Boolean).map((id) => this.store.getItem(id)).filter((i) => i?.status === "running");
+    if (tools.some((i) => i!.data.editing)) return `${who}正在修改 ${l.files.size} 个文件`;
+    if (tools.length) return `${who}正在执行：${clip(String(tools[0]!.data.title), 60)}`;
+    if ([...l.assistantItems.values()].some((a) => this.store.getItem(a.itemId)?.status === "streaming")) return `${who}正在回复`;
+    return `${who}正在思考`;
+  }
+
+  activity(convId: string) {
+    const root = this.roots.get(convId);
+    if (!root) return null;
+    const at = root.lastActivity;
+    if (root.stopping) return { kind: "stopping", text: "正在停止", at };
+    for (const l of root.active) {
+      for (const id of l.approvals.keys()) {
+        const d = this.store.getItem(id)?.data;
+        if (d) return { kind: "approval", text: `等待你批准：${d.from ? `${d.from}：` : ""}${clip(String(d.title), 60)}`, at };
+      }
+    }
+    const going = this.store.listCalls(root.id).filter((c) => STILL_GOING.includes(c.status as string));
+    const leaves = going.filter((c) => !going.some((o) => o.parent_call_id === c.id));
+    const names = [...new Set(leaves.map((c) => c.to_bot as string))].join("、");
+    const main = [...root.active].find((l) => !l.ctx?.callId);
+    const doing = main ? this.describeLive(main) : "";
+    if (leaves.length && (!main || doing.endsWith("正在思考"))) {
+      const only = leaves.length === 1 ? [...root.active].find((l) => l.ctx?.callId === leaves[0].id) : undefined;
+      return { kind: "waiting", text: `等待 ${names}${only ? `：${this.describeLive(only)}` : ""}`, at };
+    }
+    return { kind: "working", text: `${doing || "正在处理"}${leaves.length ? `（后台：${names}）` : ""}`, at };
   }
 
   private closeRoot(root: RootTurn) {
     // A task nobody collected must not keep running and spending after the turn ended.
+    const halted = root.stopping;
     if (root.active.size || [...root.tasks.values()].some((t) => t.state !== "finished")) this.stopRoot(root, "这一轮结束时还没有人取回结果，已停止");
     this.roots.delete(root.convId);
+    if (root.activityTimer) clearTimeout(root.activityTimer);
+    root.activityTimer = null;
+    this.publish({ type: "activity", convId: root.convId, activity: null });
     const status = root.overBudget ? "over_budget" : root.stopping ? "interrupted" : "completed";
     this.store.updateRootTurn(root.id, root.spent, status);
     this.broadcastBudget(root, false);
     this.setConversation(root.convId, { status: "idle" });
-    const queued = this.pendingWakes.get(root.convId);
-    if (queued?.length) {
-      const next = queued.shift()!;
-      setTimeout(() => this.wake(root.convId, next), 0);
+    // The next round's baseline must be taken after this one's card is written.
+    void this.postResult(root, status).then(() => {
+      if (this.closed) return;
+      if (halted) this.dropQueue(root.convId, root.overBudget ? "这一轮的预算用完了，没有发出" : "这一轮被停止了，没有发出");
+      else if (this.pumpQueue(root.convId)) return;
+      const queued = this.pendingWakes.get(root.convId);
+      if (queued?.length) this.wake(root.convId, queued.shift()!);
+    }).catch(() => {}); // Only happens when the daemon is shutting down around it.
+  }
+
+  // ---------- the result of a round ----------
+  // A card only when there is something to check: an answer to a question already says all it has to.
+  private async postResult(root: RootTurn, status: string) {
+    const before = await root.baseline;
+    const changes = before ? await changedSince(before) : null;
+    const gitFiles = changes?.files ?? [];
+    const files = gitFiles.length ? gitFiles : [...root.files].map((path) => ({ path, change: "修改" }));
+    const made = this.store.listWorktrees(root.convId).filter((w) => w.status === "active" && Number((w as any).created_at) >= root.startedAt);
+    if (!files.length && !made.length && !root.checks.length) return;
+    const worktrees = await Promise.all(made.map(async (w) => ({ id: w.id, branch: w.branch, bot: w.bot_name, changes: clip(await this.worktrees.changes(w), 1000) })));
+    this.addItem(root.convId, null, "result", status, {
+      summary: clip(root.lastText.trim(), 300),
+      source: gitFiles.length ? "git" : files.length ? "agent" : "none",
+      files: files.slice(0, MAX_RESULT_FILES),
+      total: files.length,
+      commits: changes?.commits ?? 0,
+      worktrees,
+      checks: root.checks,
+      // A folder with no commits yet has nothing to compare against.
+      repo: gitFiles.length && before?.head ? { top: before.top, base: before.head } : null,
+      accepted: false,
+    });
+  }
+
+  acceptResult(itemId: string) {
+    const item = this.store.getItem(itemId);
+    if (!item || item.type !== "result") throw new HttpError(404, "没有这个结果");
+    return this.updateItem(itemId, { data: { ...item.data, accepted: true } });
+  }
+
+  async resultDiff(itemId: string) {
+    const item = this.store.getItem(itemId);
+    const repo = item?.type === "result" ? (item.data.repo as { top: string; base: string } | null) : null;
+    if (!repo) throw new HttpError(404, "这个结果没有可比较的 Git 记录");
+    const files = (item!.data.files as { path: string; change: string }[]).map((f) => f.path);
+    const env = { GIT_LITERAL_PATHSPECS: "1" };
+    const diff = await git(repo.top, ["diff", "--no-color", "--no-ext-diff", repo.base, "--", ...files], env).catch((e) => {
+      throw new HttpError(409, `读不到改动：${e.message}`);
+    });
+    const untracked = (await git(repo.top, ["ls-files", "-o", "--exclude-standard", "--", ...files], env).catch(() => "")).split("\n").filter(Boolean);
+    return { base: repo.base.slice(0, 8), diff: diff.slice(0, MAX_RESULT_DIFF), clipped: diff.length > MAX_RESULT_DIFF, untracked, clippedFiles: item!.data.total !== files.length };
+  }
+
+  // ---------- messages sent while a round is running ----------
+  async followUp(convId: string, text: string, mode: string) {
+    const conv = this.store.getConversation(convId);
+    if (!conv || (conv.kind !== "direct" && conv.kind !== "group") || conv.archived) throw new HttpError(404, "对话不存在");
+    if (conv.status !== "running") {
+      await this.dispatch(conv, text);
+      return { delivered: "sent" };
     }
+    if (this.roots.get(convId)?.stopping) throw new HttpError(409, "这一轮正在停止，停下来之后再发");
+    if (conv.kind === "group") {
+      const members = this.store.groupMembers(conv.group_id!);
+      if (!parseMentions(text, members).length && !members.some((m) => m.is_chief)) throw new HttpError(400, `请 @ 至少一个成员：${members.map((m) => m.name).join("、")}`);
+    } else if (conv.agent !== this.store.getBot(conv.bot_id!)?.agent) throw new HttpError(409, "这个 Bot 已换了底层 agent，旧对话无法继续，请新建对话");
+    const l = this.live.get(convId);
+    if (mode === "steer" && conv.kind === "direct" && l?.turnId && l.runtime.steer) {
+      const turnId = l.turnId;
+      const steered = await l.runtime.steer(text).then(() => true, () => false);
+      if (steered) {
+        l.lateConv = convId;
+        this.addItem(convId, turnId, "user", "done", { text, steered: true });
+        return { delivered: "steered" };
+      }
+    }
+    if (this.store.listItems(convId).filter((i) => i.type === "queued" && i.status === "queued").length >= MAX_QUEUED) throw new HttpError(409, `最多排队 ${MAX_QUEUED} 条，请等前面的发出`);
+    const item = this.addItem(convId, null, "queued", "queued", { text });
+    // The turn may have ended while the steer was being refused.
+    if (this.store.getConversation(convId)?.status !== "running" && !this.roots.has(convId)) this.pumpQueue(convId);
+    return { delivered: "queued", itemId: item.id };
+  }
+
+  private async dispatch(conv: Conversation, text: string) {
+    return conv.kind === "group" ? this.sendGroupMessage(conv.group_id!, conv.id, text) : this.sendMessage(conv.bot_id!, conv.id, text);
+  }
+
+  // Each queued message is an ordinary message, with its own round and budget. True if one was sent.
+  private pumpQueue(convId: string): boolean {
+    const conv = this.store.getConversation(convId);
+    if (!conv || conv.status === "running") return false;
+    const next = this.store.listItems(convId).find((i) => i.type === "queued" && i.status === "queued");
+    if (!next) return false;
+    this.updateItem(next.id, { status: "sent" });
+    void this.dispatch(conv, String(next.data.text)).catch((e) => {
+      this.updateItem(next.id, { status: "unsent", data: { ...next.data, reason: (e as Error).message } });
+      this.pumpQueue(convId);
+    });
+    return true;
+  }
+
+  private dropQueue(convId: string, reason: string) {
+    for (const i of this.store.listItems(convId)) if (i.type === "queued" && i.status === "queued") this.updateItem(i.id, { status: "unsent", data: { ...i.data, reason } });
+  }
+
+  withdrawQueued(itemId: string) {
+    const item = this.store.getItem(itemId);
+    if (!item || item.type !== "queued") throw new HttpError(404, "没有这条排队的消息");
+    if (item.status !== "queued" && item.status !== "unsent") throw new HttpError(409, "这条消息已经发出了");
+    this.updateItem(itemId, { status: "withdrawn" });
+    return { text: item.data.text };
   }
 
   private broadcastBudget(root: RootTurn, active: boolean) {
@@ -327,7 +511,7 @@ export class Engine {
   // A direct chat's agent only sees what it is sent, so whatever the platform posted since the last message goes along.
   private withNotices(convId: string, text: string) {
     const items = this.store.listItems(convId);
-    const lastUser = items.findLastIndex((i) => i.type === "user");
+    const lastUser = items.findLastIndex((i) => i.type === "user" && !i.data.steered);
     const notes = items.slice(lastUser + 1).filter((i) => i.type === "notice").map((i) => `[平台通知，不是用户发的] ${i.data.text}`);
     return notes.length ? `${notes.join("\n\n")}\n\n${text}` : text;
   }
@@ -358,9 +542,12 @@ export class Engine {
       const turnId = randomUUID();
       void (async () => {
         try {
+          // Waited for so the agent cannot change anything before the "before" picture is taken, but a slow repository must not hold up a reply.
+          await Promise.race([ctx.root.baseline, new Promise((r) => setTimeout(r, BASELINE_WAIT_MS).unref())]);
+          if (this.closed) return;
           const live = await this.ensureRuntime(bot, sessionConvId, extraSystem, ctx);
           if (this.live.get(sessionConvId) !== live) throw new Error("进程启动后立刻退出了");
-          Object.assign(live, { turnId, turnStarted: Date.now(), lastUsed: Date.now(), usage: null, ctx, resolve, ticks: 0, turnTokens: 0, texts: [] });
+          Object.assign(live, { turnId, turnStarted: Date.now(), lastUsed: Date.now(), usage: null, ctx, resolve, ticks: 0, turnTokens: 0, texts: [], files: new Set(), lateConv: null });
           ctx.root.active.add(live);
           // The stop may have come while the agent was still starting.
           if (ctx.root.stopping) void this.interruptLive(live);
@@ -414,6 +601,8 @@ export class Engine {
       approvals: new Map(),
       usage: null,
       interruptTimer: null,
+      files: new Set(),
+      lateConv: null,
     };
     live.runtime = this.factory({
       agent: conv.agent,
@@ -453,6 +642,7 @@ export class Engine {
   private onEvent(l: Live, ev: AgentEvent) {
     l.lastUsed = Date.now();
     const ctx = l.ctx;
+    if (ctx) this.touch(ctx.root);
     switch (ev.type) {
       case "session":
         this.setConversation(l.convId, { session_id: ev.sessionId });
@@ -479,7 +669,10 @@ export class Engine {
         return;
       }
       case "text_done": {
-        if (!ctx) return;
+        if (!ctx) {
+          if (l.lateConv && ev.text) this.addItem(l.lateConv, null, "assistant", "done", { text: ev.text });
+          return;
+        }
         const a = l.assistantItems.get(ev.key);
         if (a) {
           if (a.timer) clearTimeout(a.timer);
@@ -498,6 +691,10 @@ export class Engine {
         if (!ctx) return;
         const id = l.toolItems.get(ev.key);
         if (id === "") return;
+        for (const f of ev.files ?? []) {
+          l.files.add(f);
+          ctx.root.files.add(f);
+        }
         if (id) {
           const cur = this.store.getItem(id)!;
           // Some agents only name the tool in a later update. Calls to Bots have their own card.
@@ -506,9 +703,10 @@ export class Engine {
             l.toolItems.set(ev.key, "");
             return;
           }
+          if (cur.status === "running" && ev.status !== "running") this.noteCheck(ctx.root, cur.data.command, ev.status);
           this.updateItem(id, {
             status: ev.status,
-            data: { ...cur.data, title: ev.title || cur.data.title, detail: ev.detail ?? cur.data.detail, output: ev.output ?? cur.data.output },
+            data: { ...cur.data, title: ev.title || cur.data.title, detail: ev.detail ?? cur.data.detail, output: ev.output ?? cur.data.output, command: ev.command ?? cur.data.command, editing: Boolean(ev.files?.length) || cur.data.editing },
           });
         } else {
           // Calls to other Bots get their own card, so the raw tool call would only repeat it.
@@ -516,8 +714,9 @@ export class Engine {
             l.toolItems.set(ev.key, "");
             return;
           }
-          const item = this.addItem(ctx.displayConvId, l.turnId, "tool", ev.status, { title: ev.title || "工具调用", detail: ev.detail, output: ev.output, ...this.speakerData(ctx) });
+          const item = this.addItem(ctx.displayConvId, l.turnId, "tool", ev.status, { title: ev.title || "工具调用", detail: ev.detail, output: ev.output, command: ev.command, editing: Boolean(ev.files?.length), ...this.speakerData(ctx) });
           l.toolItems.set(ev.key, item.id);
+          if (ev.status !== "running") this.noteCheck(ctx.root, ev.command, ev.status);
         }
         return;
       }
@@ -591,6 +790,7 @@ export class Engine {
         }
         this.finishTurn(ctx, turnId, ev.status, ev.error, l.usage, l.turnStarted);
         ctx.root.active.delete(l);
+        if (!ctx.callId && l.texts.length) ctx.root.lastText = l.texts.at(-1)!;
         const resolve = l.resolve;
         l.resolve = null;
         l.ctx = null;
@@ -605,6 +805,10 @@ export class Engine {
         return;
       }
     }
+  }
+
+  private noteCheck(root: RootTurn, command: unknown, status: string) {
+    if (typeof command === "string" && CHECK_COMMAND.test(command) && root.checks.length < 20) root.checks.push({ command: clip(command.trim().split("\n")[0], 160), status });
   }
 
   private finishTurn(ctx: TurnCtx, turnId: string, status: TurnStatus, error?: string, usage?: Live["usage"], started?: number) {
