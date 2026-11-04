@@ -112,6 +112,14 @@ export class Store {
     const old = row ? (JSON.parse(row.value as string) as string) : this.inferOldHome();
     if (old && old !== this.home) this.movePaths(old);
     this.db.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('_home', ?)").run(JSON.stringify(this.home));
+    // Copying a folder can drop empty directories, and an agent cannot start in one that is missing.
+    // Only inside the data folder: a missing directory elsewhere is the user's to deal with.
+    for (const t of ["bots", "conversations", "groups"]) {
+      for (const r of this.db.prepare(`SELECT DISTINCT cwd FROM ${t} WHERE archived=0`).all() as Row[]) {
+        const cwd = String(r.cwd);
+        if (cwd.startsWith(`${this.home}/workspaces/`) && !existsSync(cwd)) mkdirSync(cwd, { recursive: true });
+      }
+    }
   }
 
   // Databases from before this was recorded: a Bot's default directory reveals where the data lived.

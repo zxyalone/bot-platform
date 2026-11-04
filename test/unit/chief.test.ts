@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { boot, tempHome } from "../helpers.ts";
@@ -121,6 +121,20 @@ test("moving the data folder updates stored paths, keeps the user's own, and car
   const again = new Store(newHome);
   assert.equal(again.getBot(inside.id)!.cwd, moved.cwd, "a second start changes nothing");
   again.close();
+});
+
+test("a missing default directory is recreated, but a missing directory of the user's is not", () => {
+  const home = tempHome();
+  const base = { agent: "codex" as const, model: "m", effort: "low" as const, permission: "ask" as const, route: "official" as const };
+  const a = new Store(home);
+  const own = a.createBot({ ...base, name: "Own", role: "" });
+  const gone = join(tmpdir(), `bot-user-gone-${Date.now()}`);
+  a.createBot({ ...base, name: "User", role: "", cwd: gone });
+  a.close();
+  rmSync(own.cwd, { recursive: true });
+  new Store(home).close();
+  assert.equal(existsSync(own.cwd), true);
+  assert.equal(existsSync(gone), false);
 });
 
 test("a database from before the location was recorded is still repaired", () => {
