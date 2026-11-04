@@ -22,6 +22,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/icons.js": { file: "icons.js", type: "text/javascript; charset=utf-8" },
   "/settings.js": { file: "settings.js", type: "text/javascript; charset=utf-8" },
   "/research.js": { file: "research.js", type: "text/javascript; charset=utf-8" },
+  "/tasks.js": { file: "tasks.js", type: "text/javascript; charset=utf-8" },
   "/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" },
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -68,6 +69,7 @@ const SETTING_RULES: Record<string, string[] | [number, number] | "boolean"> = {
   max_depth: [1, 10],
   max_calls: [1, 100],
   max_active: [1, 10],
+  task_timeout_minutes: [0, 1440],
   low_quota: [1, 90],
   quota_refresh_minutes: [1, 120],
 };
@@ -322,6 +324,14 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       if (text.length > MAX_MESSAGE) throw new HttpError(413, "消息太长");
       const conv = await engine.sendMessage(parts[2], typeof body.conversationId === "string" ? body.conversationId : null, text);
       return json(res, 202, conv);
+    }
+    if (m === "GET" && pathname === "/api/tasks") {
+      const conv = new URL(req.url ?? "/", "http://localhost").searchParams.get("conv");
+      return json(res, 200, { tasks: engine.listTasks(conv || null) });
+    }
+    if (m === "POST" && parts[1] === "tasks" && parts[2] && parts[3] === "retry") {
+      await readJson(req);
+      return json(res, 202, engine.retryTask(parts[2]));
     }
     if (parts[1] === "conversations" && parts[2]) {
       if (m === "GET" && parts[3] === "items") {

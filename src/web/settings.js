@@ -108,6 +108,7 @@ export function mountSettings(root, ctx) {
         row("调用深度", "A 调 B、B 再调 C，算 2 层", number("max_depth", "调用深度", 1, 10)),
         row("单轮调用次数", "一条消息最多引发多少次调用", number("max_calls", "单轮调用次数", 1, 100)),
         row("同时进行", "超过时新的调用会被拒绝", number("max_active", "同时进行的调用", 1, 10)),
+        row("任务超时", "分钟。后台任务运行超过这么久就停止，Bot 只能设得更短，等你审批的时间不算。0 表示不限", number("task_timeout_minutes", "任务超时分钟数", 0, 1440)),
       ),
       group("进程", row("空闲回收", "分钟。agent 进程空闲这么久后关闭，下次发消息时自动恢复会话", number("idle_minutes", "空闲回收分钟数", 1, 1440))),
       h("p", { class: "set-note" }, "调高这些限制会让一条消息可能花掉更多额度。预算在“新建默认值”和每个 Bot 的设置里调整。"),

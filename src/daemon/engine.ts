@@ -31,7 +31,9 @@ interface RootTurn {
   active: Set<Live>;
   stopping: boolean;
   overBudget: boolean;
-  tasks: Map<string, Promise<CallResult>>;
+  // Why it was stopped. The first cause wins: stopping the main turn also closes the round.
+  stopNote: string | null;
+  tasks: Map<string, TaskRun>;
 }
 
 interface TurnCtx {
@@ -40,8 +42,46 @@ interface TurnCtx {
   depth: number;
   chain: string[];
   callId: string | null;
+  // This call and the calls above it, so a task's timeout can reach everything it started.
+  callPath: string[];
   speaker: { id: string; name: string } | null;
 }
+
+interface CallRun {
+  callId: string;
+  itemId: string;
+  callerName: string;
+  ctx: TurnCtx;
+  target: Bot;
+  child: Conversation;
+  question: string;
+  worktree: Worktree | null;
+  retryNote?: string;
+  task?: TaskRun;
+}
+
+// The in-memory half of a task. The row in `calls` is the record; this only exists while the daemon can still act on it.
+interface TaskRun extends CallRun {
+  state: "waiting" | "running" | "finished";
+  dependsOn: string[];
+  timeoutMs: number;
+  timedOut: boolean;
+  clock: NodeJS.Timeout | null;
+  forceTimer: NodeJS.Timeout | null;
+  force: (r: TurnResult) => void;
+  forced: Promise<TurnResult>;
+  settle: (r: CallResult) => void;
+  done: Promise<CallResult>;
+}
+
+const RETRYABLE = ["failed", "interrupted", "timeout"];
+const STILL_GOING = ["waiting", "running"];
+const OUTCOME: Record<string, string> = { done: "完成了", failed: "失败了", timeout: "超时了", interrupted: "被中断了" };
+const DEP_ANSWER = 4000;
+const NOTICE_ANSWER = 2000;
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+const firstLine = (s: unknown) => clip(String(s ?? "").trim().split("\n")[0], 60);
+const duration = (ms: number) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.round(ms / 100) / 10} 秒`);
 
 interface TurnResult {
   status: TurnStatus;
@@ -139,6 +179,12 @@ export class Engine {
     clearInterval(this.reaper);
     // Running jobs are detached on purpose: they keep going and are picked up after the restart.
     this.research.stop();
+    for (const root of this.roots.values()) {
+      for (const t of root.tasks.values()) {
+        if (t.clock) clearInterval(t.clock);
+        if (t.forceTimer) clearTimeout(t.forceTimer);
+      }
+    }
     for (const l of this.live.values()) {
       for (const a of l.assistantItems.values()) {
         if (a.timer) clearTimeout(a.timer);
@@ -169,7 +215,7 @@ export class Engine {
   }
 
   private openRoot(convId: string, limit: number): RootTurn {
-    const root: RootTurn = { id: randomUUID(), convId, limit, spent: 0, callCount: 0, activeCalls: 0, active: new Set(), stopping: false, overBudget: false, tasks: new Map() };
+    const root: RootTurn = { id: randomUUID(), convId, limit, spent: 0, callCount: 0, activeCalls: 0, active: new Set(), stopping: false, overBudget: false, stopNote: null, tasks: new Map() };
     this.roots.set(convId, root);
     this.store.createRootTurn(root.id, convId, limit);
     this.broadcastBudget(root, true);
@@ -178,7 +224,7 @@ export class Engine {
 
   private closeRoot(root: RootTurn) {
     // A task nobody collected must not keep running and spending after the turn ended.
-    if (root.active.size) this.stopRoot(root);
+    if (root.active.size || [...root.tasks.values()].some((t) => t.state !== "finished")) this.stopRoot(root, "这一轮结束时还没有人取回结果，已停止");
     this.roots.delete(root.convId);
     const status = root.overBudget ? "over_budget" : root.stopping ? "interrupted" : "completed";
     this.store.updateRootTurn(root.id, root.spent, status);
@@ -202,13 +248,15 @@ export class Engine {
     if (root.limit > 0 && root.spent >= root.limit && !root.overBudget) {
       root.overBudget = true;
       this.addItem(root.convId, null, "error", "done", { message: `这一轮已用 ${root.spent} tokens，达到预算 ${root.limit}，已自动暂停。要继续可以再发一条消息，或调高预算。` });
-      this.stopRoot(root);
+      this.stopRoot(root, "这一轮的预算用完了，已停止");
     }
   }
 
-  private stopRoot(root: RootTurn) {
+  private stopRoot(root: RootTurn, note: string) {
     root.stopping = true;
+    root.stopNote ??= note;
     for (const l of [...root.active]) void this.interruptLive(l);
+    this.pumpTasks(root);
   }
 
   private async interruptLive(l: Live) {
@@ -233,10 +281,11 @@ export class Engine {
     if (conv.agent !== bot.agent) throw new HttpError(409, "这个 Bot 已换了底层 agent，旧对话无法继续，请新建对话");
     if (!conversationId) this.broadcast({ type: "conversation", conversation: conv });
 
+    const prompt = this.withNotices(conv.id, text);
     this.addItem(conv.id, null, "user", "done", { text });
     this.setConversation(conv.id, { status: "running" });
     const root = this.openRoot(conv.id, bot.budget_tokens);
-    void this.runTurn(bot, conv.id, text, { root, displayConvId: conv.id, depth: 0, chain: [bot.id], callId: null, speaker: null }).finally(() => this.closeRoot(root));
+    void this.runTurn(bot, conv.id, prompt, { root, displayConvId: conv.id, depth: 0, chain: [bot.id], callId: null, callPath: [], speaker: null }).finally(() => this.closeRoot(root));
     return this.store.getConversation(conv.id)!;
   }
 
@@ -270,9 +319,17 @@ export class Engine {
       const prompt = this.groupPrompt(conv.id, session, bot) + instruction;
       const note = `你在群聊“${group.name}”里，身份是 ${bot.name}。成员：${members.map((m) => m.name).join("、")}。用户 @ 到你时才需要回复，直接回应，不用复述别人说过的话。`;
       const before = this.lastSeq(conv.id);
-      await this.runTurn(bot, session.id, prompt, { root, displayConvId: conv.id, depth: 0, chain: [bot.id], callId: null, speaker: { id: bot.id, name: bot.name } }, note);
+      await this.runTurn(bot, session.id, prompt, { root, displayConvId: conv.id, depth: 0, chain: [bot.id], callId: null, callPath: [], speaker: { id: bot.id, name: bot.name } }, note);
       this.store.updateConversation(session.id, { last_seq: Math.max(before, this.lastSeq(conv.id)) });
     }
+  }
+
+  // A direct chat's agent only sees what it is sent, so whatever the platform posted since the last message goes along.
+  private withNotices(convId: string, text: string) {
+    const items = this.store.listItems(convId);
+    const lastUser = items.findLastIndex((i) => i.type === "user");
+    const notes = items.slice(lastUser + 1).filter((i) => i.type === "notice").map((i) => `[平台通知，不是用户发的] ${i.data.text}`);
+    return notes.length ? `${notes.join("\n\n")}\n\n${text}` : text;
   }
 
   private lastSeq(convId: string) {
@@ -572,21 +629,25 @@ export class Engine {
       case "assign_task": {
         const async = tool === "assign_task";
         const body = async ? args?.task : args?.question;
-        const prepared = await this.prepareCall(l, ctx, args?.bot, body, async ? "task" : "ask", { isolated: args?.isolated === true, workspace: typeof args?.workspace === "string" ? args.workspace : undefined });
+        const dependsOn = async && Array.isArray(args?.depends_on) ? ([...new Set(args.depends_on.map(String))] as string[]) : [];
+        const timeoutMs = async ? this.taskTimeout(Number(args?.timeout_seconds) * 1000) : 0;
+        const prepared = await this.prepareCall(l, ctx, args?.bot, body, async ? "task" : "ask", { isolated: args?.isolated === true, workspace: typeof args?.workspace === "string" ? args.workspace : undefined, dependsOn, timeoutMs });
         if ("refused" in prepared) return { text: `REFUSED：${prepared.refused}`, isError: true };
-        const run = this.runCall(prepared.callId, prepared.itemId, l, ctx, prepared.target, prepared.child, String(body), prepared.worktree);
-        if (!async) return run;
-        ctx.root.tasks.set(prepared.callId, run);
-        return { text: JSON.stringify({ task_id: prepared.callId, status: "running" }), isError: false };
+        const call: CallRun = { callId: prepared.callId, itemId: prepared.itemId, callerName: l.bot.name, ctx, target: prepared.target, child: prepared.child, question: String(body), worktree: prepared.worktree };
+        if (!async) return this.runCall(call);
+        this.launchTask(call, dependsOn, timeoutMs);
+        return { text: JSON.stringify({ task_id: prepared.callId, status: this.store.getCall(prepared.callId)!.status }), isError: false };
       }
       case "get_task": {
-        const row = this.store.getCall(String(args?.task_id));
-        if (!row || row.root_turn_id !== ctx.root.id || row.mode !== "task") return { text: "没有这个任务", isError: true };
+        const asked = this.store.getCall(String(args?.task_id));
+        if (!asked || asked.root_conv_id !== ctx.root.convId || asked.mode !== "task") return { text: "没有这个任务", isError: true };
+        // A person may have retried it, in this round or a later one.
+        const row = this.store.latestAttempt(asked.id as string)!;
         const wait = Math.min(Math.max(Number(args?.wait_seconds) || 0, 0), 300);
         const run = ctx.root.tasks.get(row.id as string);
-        if (run && wait) await Promise.race([run, new Promise((r) => setTimeout(r, wait * 1000))]);
+        if (run && wait) await Promise.race([run.done, new Promise((r) => setTimeout(r, wait * 1000))]);
         const cur = this.store.getCall(row.id as string)!;
-        return { text: JSON.stringify({ task_id: cur.id, bot: cur.to_bot, status: cur.status, answer: cur.answer }), isError: cur.status === "failed" };
+        return { text: JSON.stringify({ task_id: cur.id, bot: cur.to_bot, status: cur.status, answer: cur.answer, reason: cur.reason ?? undefined }), isError: cur.status === "failed" || cur.status === "timeout" };
       }
       case "remember": {
         const scope: MemoryScope = args?.scope === "project" ? "project" : "bot";
@@ -714,14 +775,47 @@ export class Engine {
     if (!bot || conv.agent !== bot.agent) return;
     this.setConversation(convId, { status: "running" });
     const root = this.openRoot(convId, bot.budget_tokens);
-    void this.runTurn(bot, convId, prompt, { root, displayConvId: convId, depth: 0, chain: [bot.id], callId: null, speaker: null }).finally(() => this.closeRoot(root));
+    void this.runTurn(bot, convId, prompt, { root, displayConvId: convId, depth: 0, chain: [bot.id], callId: null, callPath: [], speaker: null }).finally(() => this.closeRoot(root));
   }
 
-  private async prepareCall(l: Live, ctx: TurnCtx, name: unknown, body: unknown, mode: string, place: { isolated: boolean; workspace?: string }): Promise<{ refused: string } | { callId: string; itemId: string; target: Bot; child: Conversation; worktree: Worktree | null }> {
+  // What every call must pass, whether a Bot asks for it or a person retries one.
+  private callRefusal(caller: Bot, target: Bot, at: { chain: string[]; depth: number }, root: Pick<RootTurn, "stopping" | "overBudget" | "callCount" | "activeCalls">, deferred: boolean): string | null {
+    if (target.id === caller.id) return "不能调用自己";
+    if (target.paused) return `${target.name} 已被暂停`;
+    const allowed = canCallList(caller);
+    if (allowed && !allowed.includes(target.id)) return `${caller.name} 没有调用 ${target.name} 的权限`;
+    if (at.chain.includes(target.id)) return `${target.name} 已经在这条调用链上，不能循环调用`;
+    const limits = this.store.settings();
+    if (at.depth + 1 > limits.max_depth) return `调用深度已达上限 ${limits.max_depth}`;
+    if (root.stopping) return root.overBudget ? "本轮预算已用完" : "这一轮已被停止";
+    if (root.callCount >= limits.max_calls) return `这一轮的调用次数已达上限 ${limits.max_calls}`;
+    // A task waiting for its dependencies is not running yet; it takes a slot when it starts.
+    if (!deferred && root.activeCalls >= limits.max_active) return `同时进行的调用已达上限 ${limits.max_active}，请先等待结果`;
+    return null;
+  }
+
+  private dependencyRefusal(ids: string[], rootConvId: string): string | null {
+    for (const id of ids) {
+      const first = this.store.getCall(id);
+      if (!first || first.root_conv_id !== rootConvId || first.mode !== "task") return `没有任务 ${id}，depends_on 只能写这个对话里的 task_id`;
+      const dep = this.store.latestAttempt(id)!;
+      if (dep.status !== "done" && !STILL_GOING.includes(dep.status as string)) return `依赖的任务（${dep.to_bot}：${firstLine(dep.question)}）没有完成，状态是 ${dep.status}`;
+    }
+    return null;
+  }
+
+  // Shortening is the only thing a Bot can do: the setting is also the ceiling. 0 means no limit.
+  private taskTimeout(askedMs: number) {
+    const ceiling = this.store.settings().task_timeout_minutes * 60000;
+    if (!(askedMs > 0)) return ceiling;
+    return ceiling ? Math.min(askedMs, ceiling) : askedMs;
+  }
+
+  private async prepareCall(l: Live, ctx: TurnCtx, name: unknown, body: unknown, mode: string, place: { isolated: boolean; workspace?: string; dependsOn: string[]; timeoutMs: number }): Promise<{ refused: string } | { callId: string; itemId: string; target: Bot; child: Conversation; worktree: Worktree | null }> {
     const root = ctx.root;
     const refuse = (reason: string, to = String(name ?? "?")) => {
       const id = randomUUID();
-      this.store.addCall({ id, rootTurnId: root.id, rootConvId: root.convId, callerConvId: l.convId, childConvId: null, parentCallId: ctx.callId, from: l.bot.name, to, mode, depth: ctx.depth + 1, question: String(body ?? "").slice(0, 2000), status: "refused", answer: reason });
+      this.store.addCall({ id, rootTurnId: root.id, rootConvId: root.convId, callerConvId: l.convId, childConvId: null, parentCallId: ctx.callId, from: l.bot.name, to, mode, depth: ctx.depth + 1, question: String(body ?? "").slice(0, 2000), status: "refused", answer: reason, reason });
       this.addItem(ctx.displayConvId, l.turnId, "call", "refused", { from: l.bot.name, to, question: String(body ?? "").slice(0, 2000), answer: reason, mode });
       this.broadcast({ type: "trace", convId: root.convId });
       return { refused: reason };
@@ -729,16 +823,9 @@ export class Engine {
     if (typeof body !== "string" || !body.trim()) return refuse("问题不能为空");
     const target = this.store.listBots().find((b) => b.name.toLowerCase() === String(name ?? "").trim().toLowerCase());
     if (!target) return refuse(`没有叫 ${String(name)} 的 Bot，请先用 list_bots 查看`);
-    if (target.id === l.bot.id) return refuse("不能调用自己", target.name);
-    if (target.paused) return refuse(`${target.name} 已被暂停`, target.name);
-    const allowed = canCallList(l.bot);
-    if (allowed && !allowed.includes(target.id)) return refuse(`${l.bot.name} 没有调用 ${target.name} 的权限`, target.name);
-    if (ctx.chain.includes(target.id)) return refuse(`${target.name} 已经在这条调用链上，不能循环调用`, target.name);
-    const limits = this.store.settings();
-    if (ctx.depth + 1 > limits.max_depth) return refuse(`调用深度已达上限 ${limits.max_depth}`, target.name);
-    if (root.stopping) return refuse(root.overBudget ? "本轮预算已用完" : "这一轮已被停止", target.name);
-    if (root.callCount >= limits.max_calls) return refuse(`这一轮的调用次数已达上限 ${limits.max_calls}`, target.name);
-    if (root.activeCalls >= limits.max_active) return refuse(`同时进行的调用已达上限 ${limits.max_active}，请先等待结果`, target.name);
+    const deferred = place.dependsOn.length > 0;
+    const refusal = this.callRefusal(l.bot, target, ctx, root, deferred) ?? this.dependencyRefusal(place.dependsOn, root.convId);
+    if (refusal) return refuse(refusal, target.name);
 
     if (place.isolated && place.workspace) return refuse("isolated 和 workspace 只能选一个", target.name);
     let cwd = this.store.getConversation(l.convId)!.cwd;
@@ -751,11 +838,12 @@ export class Engine {
     }
     let child = place.isolated ? undefined : this.store.findChild("call", l.convId, target.id, cwd);
     if (child && child.agent !== target.agent) child = undefined;
-    if (child && this.live.get(child.id)?.turnId) return refuse(`${target.name} 正在处理你上一个请求，请先等待结果`, target.name);
+    // A deferred task starts once that Bot is free, so being busy now is not a reason to refuse it.
+    if (child && !deferred && this.live.get(child.id)?.turnId) return refuse(`${target.name} 正在处理你上一个请求，请先等待结果`, target.name);
 
     // Counted before the first await, so parallel calls cannot slip past the limits.
     root.callCount++;
-    root.activeCalls++;
+    if (!deferred) root.activeCalls++;
     let worktree: Worktree | null = null;
     if (place.isolated) {
       try {
@@ -765,32 +853,274 @@ export class Engine {
         this.broadcast({ type: "worktrees", convId: root.convId });
       } catch (e) {
         root.callCount--;
-        root.activeCalls--;
+        if (!deferred) root.activeCalls--;
         return refuse((e as Error).message, target.name);
       }
     }
     child ??= this.store.createChild("call", l.convId, target, cwd, `${l.bot.name} → ${target.name}`);
     const callId = randomUUID();
-    this.store.addCall({ id: callId, rootTurnId: root.id, rootConvId: root.convId, callerConvId: l.convId, childConvId: child.id, parentCallId: ctx.callId, from: l.bot.name, to: target.name, mode, depth: ctx.depth + 1, question: body, status: "running" });
-    const item = this.addItem(ctx.displayConvId, l.turnId, "call", "running", { from: l.bot.name, to: target.name, toId: target.id, question: body, childConvId: child.id, mode, callId, branch: worktree?.branch });
+    const status = deferred ? "waiting" : "running";
+    this.store.addCall({ id: callId, rootTurnId: root.id, rootConvId: root.convId, callerConvId: l.convId, childConvId: child.id, parentCallId: ctx.callId, from: l.bot.name, to: target.name, mode, depth: ctx.depth + 1, question: body, status, chain: ctx.chain, dependsOn: place.dependsOn, timeoutMs: place.timeoutMs });
+    const item = this.addItem(ctx.displayConvId, l.turnId, "call", status, { from: l.bot.name, to: target.name, toId: target.id, question: body, childConvId: child.id, mode, callId, branch: worktree?.branch });
     this.broadcast({ type: "trace", convId: root.convId });
     return { callId, itemId: item.id, target, child, worktree };
   }
 
-  private async runCall(callId: string, itemId: string, caller: Live, ctx: TurnCtx, target: Bot, child: Conversation, question: string, worktree: Worktree | null): Promise<CallResult> {
+  private async runCall(c: CallRun): Promise<CallResult> {
+    const { callId, itemId, ctx, target, child, worktree, task } = c;
     const chainNames = [...ctx.chain.map((id) => this.store.getBot(id)?.name ?? "?"), target.name].join(" → ");
-    const prompt = `这是来自同事 Bot ${caller.bot.name} 的请求（调用链：${chainNames}）。请完成它，并在最后一条回复里直接给出结论，对方只能看到这条回复。${worktree ? `\n\n你在独立的 Git 工作树里工作（分支 ${worktree.branch}），改动不会影响别人。不用提交，用户验收后平台会统一提交。` : ""}\n\n${question}`;
-    const r = await this.runTurn(target, child.id, prompt, { root: ctx.root, displayConvId: child.id, depth: ctx.depth + 1, chain: [...ctx.chain, target.id], callId, speaker: null });
+    const deps = (task?.dependsOn ?? []).map((id) => this.store.latestAttempt(id)!).map((d) => `\n\n它依赖的任务（${d.to_bot}：${firstLine(d.question)}）已完成，结论：\n${clip(String(d.answer ?? ""), DEP_ANSWER)}`);
+    const prompt = `这是来自同事 Bot ${c.callerName} 的请求（调用链：${chainNames}）。请完成它，并在最后一条回复里直接给出结论，对方只能看到这条回复。${worktree ? `\n\n你在独立的 Git 工作树里工作（分支 ${worktree.branch}），改动不会影响别人。不用提交，用户验收后平台会统一提交。` : ""}${c.retryNote ? `\n\n${c.retryNote}` : ""}${deps.join("")}\n\n${c.question}`;
+    const turn = this.runTurn(target, child.id, prompt, { root: ctx.root, displayConvId: child.id, depth: ctx.depth + 1, chain: [...ctx.chain, target.id], callId, callPath: [...ctx.callPath, callId], speaker: null });
+    const r = await (task ? Promise.race([turn, task.forced]) : turn);
     ctx.root.activeCalls--;
     const answer = r.text.length > MAX_ANSWER ? `${r.text.slice(0, MAX_ANSWER)}\n…（回答过长，已截断）` : r.text;
-    const status = r.status === "completed" ? "done" : r.status;
+    const completed = r.status === "completed";
+    const status = completed ? "done" : task?.timedOut ? "timeout" : r.status;
+    const reason = completed ? null : this.stopReason(c, r);
     const place = worktree ? `\n\n[工作树路径：${worktree.path}，分支：${worktree.branch}]\n[平台检查的${await this.worktrees.changes(worktree)}]` : "";
-    const shown = (r.status === "completed" ? answer || "（对方没有文字回复）" : r.error || (r.status === "interrupted" ? "调用被中断" : "调用失败")) + place;
-    this.store.finishCall(callId, status, shown, r.tokens);
+    const shown = (completed ? answer || "（对方没有文字回复）" : reason) + place;
+    this.store.finishCall(callId, status, shown, r.tokens, reason);
     const cur = this.store.getItem(itemId);
     if (cur) this.updateItem(itemId, { status, data: { ...cur.data, answer: shown, tokens: r.tokens } });
     this.broadcast({ type: "trace", convId: ctx.root.convId });
-    return { text: shown, isError: r.status !== "completed" };
+    this.pumpTasks(ctx.root);
+    return { text: shown, isError: !completed };
+  }
+
+  // The most specific thing we know, because this is what a person reads to decide whether to retry.
+  private stopReason(c: CallRun, r: TurnResult) {
+    const { root } = c.ctx;
+    if (c.task?.timedOut) return `超过 ${duration(c.task.timeoutMs)}没有完成，已停止`;
+    if (r.status === "failed") return r.error || "调用失败";
+    if (c.ctx.callPath.some((id) => root.tasks.get(id)?.timedOut)) return "它所属的任务超时了，一起停止";
+    return root.stopNote ?? "调用被中断";
+  }
+
+  // ---------- tasks ----------
+  private launchTask(call: CallRun, dependsOn: string[], timeoutMs: number) {
+    let settle!: TaskRun["settle"];
+    let force!: TaskRun["force"];
+    const done = new Promise<CallResult>((r) => (settle = r));
+    const forced = new Promise<TurnResult>((r) => (force = r));
+    const task: TaskRun = { ...call, state: "waiting", dependsOn, timeoutMs, timedOut: false, clock: null, forceTimer: null, force, forced, settle, done };
+    task.task = task;
+    call.ctx.root.tasks.set(call.callId, task);
+    if (dependsOn.length) this.pumpTasks(call.ctx.root);
+    else this.startTask(task);
+    return task;
+  }
+
+  private startTask(task: TaskRun) {
+    task.state = "running";
+    this.startClock(task);
+    void this.runCall(task).then((r) => {
+      if (task.clock) clearInterval(task.clock);
+      if (task.forceTimer) clearTimeout(task.forceTimer);
+      task.state = "finished";
+      task.settle(r);
+      // Only now is its Bot free for whoever is queued behind it.
+      this.pumpTasks(task.ctx.root);
+    });
+  }
+
+  // Starts what can start and ends what can no longer run. Called whenever a slot frees up or a task ends.
+  private pumpTasks(root: RootTurn) {
+    const maxActive = this.store.settings().max_active;
+    let ended = false;
+    for (const t of root.tasks.values()) {
+      if (t.state !== "waiting") continue;
+      if (root.stopping) {
+        this.endWaiting(t, "interrupted", this.stopReason(t, { status: "interrupted", text: "", tokens: 0 }));
+        ended = true;
+        continue;
+      }
+      const deps = t.dependsOn.map((id) => this.store.latestAttempt(id)!);
+      const failed = deps.find((d) => d.status !== "done" && !STILL_GOING.includes(d.status as string));
+      if (failed) {
+        this.endWaiting(t, "failed", `依赖的任务（${failed.to_bot}：${firstLine(failed.question)}）没有完成：${firstLine(failed.reason ?? failed.status)}`);
+        ended = true;
+        continue;
+      }
+      if (deps.some((d) => d.status !== "done") || root.activeCalls >= maxActive || this.childBusy(t.child.id, root)) continue;
+      root.activeCalls++;
+      this.store.startCall(t.callId);
+      const cur = this.store.getItem(t.itemId);
+      if (cur) this.updateItem(t.itemId, { status: "running" });
+      this.broadcast({ type: "trace", convId: root.convId });
+      this.startTask(t);
+    }
+    // Ending one can decide the fate of those waiting on it.
+    if (ended) this.pumpTasks(root);
+  }
+
+  private childBusy(childId: string, root: RootTurn) {
+    return Boolean(this.live.get(childId)?.turnId) || [...root.tasks.values()].some((t) => t.state === "running" && t.child.id === childId);
+  }
+
+  private endWaiting(t: TaskRun, status: string, reason: string) {
+    t.state = "finished";
+    this.store.finishCall(t.callId, status, reason, 0, reason);
+    const cur = this.store.getItem(t.itemId);
+    if (cur) this.updateItem(t.itemId, { status, data: { ...cur.data, answer: reason } });
+    this.broadcast({ type: "trace", convId: t.ctx.root.convId });
+    t.settle({ text: reason, isError: true });
+  }
+
+  private inSubtree(task: TaskRun) {
+    return [...task.ctx.root.active].filter((l) => l.ctx?.callPath.includes(task.callId));
+  }
+
+  // Only time spent working counts: a person who has not answered an approval yet is not the task being slow.
+  private startClock(task: TaskRun) {
+    if (!task.timeoutMs) return;
+    let last = Date.now();
+    let used = 0;
+    task.clock = setInterval(() => {
+      const now = Date.now();
+      if (!this.inSubtree(task).some((l) => l.approvals.size)) used += now - last;
+      last = now;
+      if (used < task.timeoutMs) return;
+      clearInterval(task.clock!);
+      task.clock = null;
+      this.timeOutTask(task);
+    }, Math.max(20, Math.min(1000, task.timeoutMs / 4)));
+    task.clock.unref();
+  }
+
+  // Stops this task and what it started, and nothing else in the round.
+  private timeOutTask(task: TaskRun) {
+    const { root } = task.ctx;
+    task.timedOut = true;
+    for (const l of this.inSubtree(task)) void this.interruptLive(l);
+    for (const t of root.tasks.values()) {
+      if (t.state === "waiting" && t.ctx.callPath.includes(task.callId)) this.endWaiting(t, "interrupted", "它所属的任务超时了，一起停止");
+    }
+    // An agent stuck before its turn began has nothing to interrupt, and the task must still end.
+    task.forceTimer = setTimeout(() => {
+      this.dropRuntime(task.child.id);
+      task.force({ status: "interrupted", text: "", tokens: 0 });
+    }, INTERRUPT_GRACE_MS + 1000);
+    task.forceTimer.unref();
+  }
+
+  // Only a person can retry, and it goes through the same checks a Bot's call does. Nothing here
+  // awaits before the new row exists, so a double click cannot start it twice.
+  retryTask(id: string) {
+    const row = this.store.getCall(id);
+    if (!row || row.mode !== "task") throw new HttpError(404, "任务不存在");
+    if (!RETRYABLE.includes(row.status as string)) throw new HttpError(409, "只有失败、超时或中断的任务可以重试");
+    if (this.store.latestAttempt(id)!.id !== id) throw new HttpError(409, "这个任务已经重试过了");
+    const conv = this.store.getConversation(row.root_conv_id as string);
+    if (!conv) throw new HttpError(404, "这个任务的对话已归档");
+    if (!row.chain) throw new HttpError(409, "这个任务是旧版本建的，没有调用链记录，无法确认限制，不能重试");
+    const chain = JSON.parse(row.chain as string) as string[];
+    const caller = this.store.getBot(chain.at(-1)!);
+    const callerConv = this.store.getConversation(row.caller_conv_id as string);
+    if (!caller || !callerConv) throw new HttpError(409, `发起这个任务的 ${row.from_bot} 已归档`);
+    const oldChild = row.child_conv_id ? this.store.getConversation(row.child_conv_id as string) : undefined;
+    const target = oldChild?.bot_id ? this.store.getBot(oldChild.bot_id) : undefined;
+    if (!oldChild || !target) throw new HttpError(409, `${row.to_bot} 已归档`);
+    const budget = conv.kind === "group" ? this.store.getGroup(conv.group_id!)?.budget_tokens : conv.bot_id ? this.store.getBot(conv.bot_id)?.budget_tokens : undefined;
+    if (budget === undefined) throw new HttpError(409, "这个对话所属的 Bot 或群聊已归档");
+
+    const open = this.roots.get(conv.id);
+    const dependsOn = row.depends_on ? (JSON.parse(row.depends_on as string) as string[]) : [];
+    const depRefusal = this.dependencyRefusal(dependsOn, conv.id);
+    if (depRefusal) throw new HttpError(409, `${depRefusal}，请先重试它`);
+    const deferred = dependsOn.some((d) => this.store.latestAttempt(d)!.status !== "done");
+    const at = { chain, depth: (row.depth as number) - 1 };
+    const refusal = this.callRefusal(caller, target, at, open ?? { stopping: false, overBudget: false, callCount: 0, activeCalls: 0 }, deferred);
+    if (refusal) throw new HttpError(409, refusal);
+    if (open && !deferred && this.childBusy(oldChild.id, open)) throw new HttpError(409, `${target.name} 正在忙，请等它结束再重试`);
+    const worktree = this.store.listWorktrees(conv.id).find((w) => oldChild.cwd === w.path || oldChild.cwd.startsWith(`${w.path}/`)) ?? null;
+    if (worktree && worktree.status !== "active") throw new HttpError(409, "这个任务的工作树已经合并或丢弃，不能在上面重试");
+
+    // With no round open this is like the person sending another message: a new round under the normal per-round budget.
+    if (!open) this.setConversation(conv.id, { status: "running" });
+    const root = open ?? this.openRoot(conv.id, budget);
+    root.callCount++;
+    if (!deferred) root.activeCalls++;
+    const child = oldChild.agent === target.agent ? oldChild : this.store.createChild("call", callerConv.id, target, oldChild.cwd, `${caller.name} → ${target.name}`);
+    const callId = randomUUID();
+    const status = deferred ? "waiting" : "running";
+    const timeoutMs = this.taskTimeout(Number(row.timeout_ms));
+    const parent = open ? (row.parent_call_id as string | null) : null;
+    this.store.addCall({ id: callId, rootTurnId: root.id, rootConvId: conv.id, callerConvId: callerConv.id, childConvId: child.id, parentCallId: parent, from: caller.name, to: target.name, mode: "task", depth: row.depth as number, question: row.question as string, status, chain, dependsOn, retryOf: id, timeoutMs });
+    const item = this.addItem(conv.id, null, "call", status, { from: caller.name, to: target.name, toId: target.id, question: row.question, childConvId: child.id, mode: "task", callId, branch: worktree?.branch, retry: true });
+    this.broadcast({ type: "trace", convId: conv.id });
+    const ctx: TurnCtx = { root, displayConvId: conv.id, depth: at.depth, chain, callId: parent, callPath: parent ? this.callPath(parent) : [], speaker: null };
+    const retryNote = `这是一次重试，上一次的结果：${firstLine(row.reason ?? row.status)}。之前做的可能已经留下了，先确认再继续。`;
+    const task = this.launchTask({ callId, itemId: item.id, callerName: caller.name, ctx, target, child, question: row.question as string, worktree, retryNote }, dependsOn, timeoutMs);
+    // Whoever asked for this has ended its turn, so the result goes where the next turn will read it.
+    if (!open) {
+      void task.done.then((r) => {
+        const after = this.store.getCall(callId)!;
+        this.addItem(conv.id, null, "notice", "done", { text: `重试的任务（${after.from_bot} → ${after.to_bot}，task_id ${callId}）${OUTCOME[after.status as string] ?? after.status}：${clip(r.text, NOTICE_ANSWER)}` });
+        this.closeRoot(root);
+      });
+    }
+    return this.taskView(this.store.getCall(callId)!);
+  }
+
+  private callPath(callId: string) {
+    const path: string[] = [];
+    for (let cur = this.store.getCall(callId); cur; cur = cur.parent_call_id ? this.store.getCall(cur.parent_call_id as string) : undefined) path.unshift(cur.id as string);
+    return path;
+  }
+
+  listTasks(convId: string | null) {
+    const rows = this.store.listTasks(convId, 300);
+    const replaced = new Set(rows.map((r) => r.retry_of));
+    return rows.filter((r) => !replaced.has(r.id)).map((r) => this.taskView(r));
+  }
+
+  private taskView(r: Record<string, unknown>) {
+    const ids = r.depends_on ? (JSON.parse(r.depends_on as string) as string[]) : [];
+    const deps = ids.map((id) => this.store.latestAttempt(id)).filter((d) => d !== undefined);
+    const failing = RETRYABLE.includes(r.status as string) || r.status === "refused";
+    return {
+      id: r.id,
+      conv_id: r.root_conv_id,
+      conv_title: r.conv_title,
+      conv_kind: r.conv_kind,
+      bot_id: r.conv_bot_id,
+      group_id: r.conv_group_id,
+      from: r.from_bot,
+      owner: r.to_bot,
+      question: r.question,
+      status: r.status,
+      depends_on: deps.map((d) => ({ id: d.id, owner: d.to_bot, title: firstLine(d.question), status: d.status })),
+      waiting_reason: this.waitingReason(r, deps),
+      failure_reason: failing ? (r.reason ?? r.answer ?? "没有记录原因") : null,
+      answer: r.status === "done" ? r.answer : null,
+      tokens: r.tokens,
+      timeout_ms: r.timeout_ms,
+      attempt: this.store.attemptNumber(r.id as string),
+      can_retry: RETRYABLE.includes(r.status as string) && Boolean(r.chain) && this.store.latestAttempt(r.id as string)!.id === r.id,
+      created_at: r.created_at,
+      ended_at: r.ended_at,
+    };
+  }
+
+  // Worked out when read: what a task is waiting on changes all the time and means nothing after a restart.
+  private waitingReason(r: Record<string, unknown>, deps: Record<string, unknown>[]) {
+    if (r.status === "waiting") {
+      const open = deps.filter((d) => d.status !== "done");
+      if (open.length) return `等 ${open.map((d) => `${d.to_bot} 完成“${firstLine(d.question)}”`).join("、")}`;
+      const root = this.roots.get(r.root_conv_id as string);
+      const max = this.store.settings().max_active;
+      return root && root.activeCalls >= max ? `等并发名额（同时最多 ${max} 个）` : `等 ${r.to_bot} 忙完手上的事`;
+    }
+    if (r.status !== "running") return null;
+    const task = this.roots.get(r.root_conv_id as string)?.tasks.get(r.id as string);
+    if (task) {
+      for (const l of this.inSubtree(task)) {
+        for (const itemId of l.approvals.keys()) return `等你审批：${l.bot.name} 的“${this.store.getItem(itemId)?.data.title ?? "操作"}”`;
+      }
+    }
+    const asked = this.store.listCalls(r.root_turn_id as string).filter((c) => c.parent_call_id === r.id && c.status === "running");
+    return asked.length ? `等 ${asked.map((c) => c.to_bot).join("、")} 回复` : null;
   }
 
   trace(convId: string) {
@@ -836,7 +1166,7 @@ export class Engine {
     const conv = this.store.getConversation(convId);
     if (!conv) throw new HttpError(404, "对话不存在");
     const root = this.roots.get(convId);
-    if (root) this.stopRoot(root);
+    if (root) this.stopRoot(root, "用户停止了这一轮");
   }
 
   archiveConversation(convId: string) {

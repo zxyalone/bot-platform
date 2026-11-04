@@ -502,3 +502,25 @@ summary::-webkit-details-marker { display: none; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* Task center */
+.task-card { display: grid; gap: 5px; }
+.task-title { overflow-wrap: anywhere; white-space: pre-wrap; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.task-card .tag { flex: none; align-self: flex-start; }
+.task-line { display: flex; gap: 10px; font-size: 0.84rem; overflow-wrap: anywhere; }
+.task-line > :last-child { min-width: 0; }
+.task-label { flex: none; width: 3.5em; color: var(--muted); }
+.task-dep { display: block; }
+.task-waiting { color: var(--warning); }
+.task-failure { color: var(--danger); }
+.task-answer { font-size: 0.84rem; }
+.task-answer p { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16em; overflow-y: auto; }
+.task-foot { display: flex; align-items: center; gap: 8px; }
+.task-foot button { padding: 1px 10px; font-size: 0.78rem; }
+.task-foot .link-btn { min-width: 0; padding: 0; border: 0; background: transparent; color: var(--accent-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag.state-failed, .tag.state-timeout, .tag.state-refused { color: var(--danger); background: var(--danger-bg); }
+.tag.state-interrupted { color: var(--warning); background: var(--warning-bg); }
+.tag.state-waiting { color: var(--muted); background: var(--panel-2); }
+.tag.state-done { color: var(--success); }
+.call-card.timeout { background: var(--danger-bg); border-color: var(--danger-line); }
+.call-card.timeout .tool-status { color: var(--danger); }

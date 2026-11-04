@@ -3,6 +3,7 @@ import { renderMarkdown } from "./markdown.js";
 import { icon } from "./icons.js";
 import { mountResearch } from "./research.js";
 import { mountSettings } from "./settings.js";
+import { mountTasks, TASK_STATUS } from "./tasks.js";
 
 const AGENT_LABEL = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", antigravity: "Antigravity" };
 const EFFORT_LABEL = { low: "低", medium: "中", high: "高" };
@@ -238,6 +239,8 @@ function handleEvent(ev) {
       return;
     }
     case "item": {
+      // What a task is waiting on includes approvals, which do not touch its call.
+      if (ev.item.type === "approval") refreshTasksPage();
       if (ev.item.conv_id !== state.convId) {
         if (ev.item.type === "approval") renderSidebar();
         return;
@@ -284,6 +287,7 @@ function handleEvent(ev) {
       return;
     }
     case "trace": {
+      refreshTasksPage();
       if (ev.convId === state.convId) refreshTrace();
       return;
     }
@@ -362,6 +366,15 @@ async function refreshWorktrees() {
     state.worktrees = data.worktrees;
     renderDetails();
   }
+}
+
+let tasksTimer = 0;
+function refreshTasksPage() {
+  if (state.view !== "tasks") return;
+  clearTimeout(tasksTimer);
+  tasksTimer = setTimeout(() => {
+    if (state.view === "tasks") state.page?.refresh();
+  }, 150);
 }
 
 let traceTimer = 0;
@@ -519,7 +532,7 @@ function renderSidebar() {
     h("div", { class: "bot-list" }, groupRows.length ? groupRows : h("p", { class: "empty-hint" }, "把几个 Bot 拉进群聊，需要谁就 @ 谁。")),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "Bots"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建 Bot", title: "新建 Bot", onclick: () => openBotDialog() }, icon("plus", 16))),
     h("div", { class: "bot-list" }, rows.length ? rows : h("p", { class: "empty-hint" }, "还没有 Bot，先建一个。")),
-    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
+    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
   );
 }
 
@@ -636,6 +649,24 @@ function openResearch() {
       dlg.showModal();
     },
   });
+}
+
+function openTasks() {
+  saveDraft();
+  state.view = "tasks";
+  state.sidebarOpen = false;
+  $("app").classList.remove("sidebar-open");
+  $("app").classList.add("full-page");
+  state.page = mountTasks($("main"), {
+    api,
+    h,
+    onBack: () => {
+      leaveResearch();
+      render({ focus: true });
+    },
+    onOpen: (t) => (t.group_id ? selectGroup(t.group_id, t.conv_id) : selectBot(t.bot_id, t.conv_id)),
+  });
+  renderSidebar();
 }
 
 function openSettings() {
@@ -1012,7 +1043,7 @@ function itemNode(item) {
   }
 }
 
-const CALL_STATUS = { running: "进行中", done: "完成", failed: "失败", interrupted: "已中断", refused: "被拒绝" };
+const CALL_STATUS = TASK_STATUS;
 
 function callNode(item, attrs) {
   const d = item.data;

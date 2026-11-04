@@ -13,6 +13,7 @@ import type { AgentRuntime, ApprovalDecision, RuntimeOptions } from "../src/daem
 
 const port = Number(process.env.PORT || 4317);
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let scoutRuns = 0;
 
 function bus(o: RuntimeOptions, tool: string, args: unknown): Promise<{ text: string }> {
   const body = JSON.stringify({ tool, args });
@@ -54,7 +55,16 @@ class Scripted implements AgentRuntime {
     e({ type: "usage_tick", tokens: 2500 });
     const name = this.o.systemPrompt.match(/DEMO:(\w+)/)?.[1];
     if (name === "Chief") {
-      if (/平台通知/.test(prompt)) {
+      if (/派任务/.test(prompt)) {
+        await this.stream("我拆成三个后台任务：Reviewer 先审，Engineer 等审查结论再改，Scout 查资料限时 3 秒。");
+        const task = async (args: object) => JSON.parse((await bus(this.o, "assign_task", args)).text).task_id;
+        const review = await task({ bot: "Reviewer", task: "后台审查 boundary_loss.py，重点看类别不平衡。" });
+        const fix = await task({ bot: "Engineer", task: "按审查结论修改 boundary_loss.py。", depends_on: [review] });
+        const scout = await task({ bot: "Scout", task: "查一下边界损失的已有实现。", timeout_seconds: 3 });
+        const results = [];
+        for (const id of [scout, review, fix]) results.push(JSON.parse((await bus(this.o, "get_task", { task_id: id, wait_seconds: 60 })).text));
+        await this.stream(results.map((r) => `- ${r.bot}：${r.status}`).join("\n"));
+      } else if (/平台通知/.test(prompt)) {
         const m = prompt.match(/\{.*?\}/)?.[0] ?? "";
         await this.stream("实验结束了，指标是 `" + m + "`。我建议判定为不成立，请你在实验工作台确认。");
       } else if (/实验/.test(prompt)) {
@@ -86,8 +96,14 @@ class Scripted implements AgentRuntime {
       if (this.stopped) return;
       const review = await bus(this.o, "ask_bot", { bot: "Reviewer", question: "请审查 boundary_loss.py，重点看类别不平衡时的表现。" });
       await this.stream(`Reviewer 的结论：\n\n> ${review.text}\n\n我会按建议修改。`);
+    } else if (name === "Scout") {
+      // Hangs the first time so the timeout and the retry button can be tried.
+      if (scoutRuns++ === 0) while (!this.stopped) await wait(100);
+      if (this.stopped) return;
+      await this.stream("这次查到了：常见做法是在 Dice 之外加一项边界距离。");
     } else if (name === "Reviewer") {
-      await wait(500);
+      await wait(/后台/.test(prompt) ? 6000 : 500);
+      if (this.stopped) return;
       await this.stream("发现一个问题：`pred` 全空时分母为 0，需要加 `eps`。\n\n| 严重度 | 位置 |\n|---|---|\n| 高 | 第 2 行 |");
     } else {
       await this.stream(`我是 ${name ?? "Bot"}。这是脚本回复，用来试界面，没有消耗额度。`);
@@ -109,17 +125,21 @@ class Scripted implements AgentRuntime {
   }
 }
 
-const store = new Store(mkdtempSync(join(tmpdir(), "bot-demo-")));
-const a = store.createBot({ name: "Engineer", role: "写代码。DEMO:Engineer", agent: "codex", model: "gpt-6.1-terra", effort: "medium", permission: "ask", route: "official" });
-const b = store.createBot({ name: "Reviewer", role: "审查代码。DEMO:Reviewer", agent: "claude", model: "claude-sonnet-5-5", effort: "medium", permission: "ask", route: "official" });
-store.createGroup({ name: "方案评审", members: [a.id, b.id] });
-const repo = mkdtempSync(join(tmpdir(), "bot-demo-repo-"));
-const run = (...args: string[]) => execFileSync("git", args, { cwd: repo });
-run("init", "-q", "-b", "main");
-writeFileSync(join(repo, "README.md"), "demo\n");
-run("add", "-A");
-run("-c", "user.name=demo", "-c", "user.email=demo@localhost", "commit", "-q", "-m", "init");
-store.createBot({ name: "Chief", role: "调度。DEMO:Chief", agent: "claude", model: "claude-opus-5-5", effort: "medium", permission: "read_only", route: "official", budget_tokens: 300000, is_chief: 1, cwd: repo });
+// DEMO_HOME keeps the data between runs, so a restart can be tried. Without it every run starts clean.
+const store = new Store(process.env.DEMO_HOME || mkdtempSync(join(tmpdir(), "bot-demo-")));
+if (!store.listBots().length) {
+  const a = store.createBot({ name: "Engineer", role: "写代码。DEMO:Engineer", agent: "codex", model: "gpt-6.1-terra", effort: "medium", permission: "ask", route: "official" });
+  const b = store.createBot({ name: "Reviewer", role: "审查代码。DEMO:Reviewer", agent: "claude", model: "claude-sonnet-5-5", effort: "medium", permission: "ask", route: "official" });
+  store.createBot({ name: "Scout", role: "查资料。DEMO:Scout", agent: "claude", model: "claude-sonnet-5-5", effort: "medium", permission: "read_only", route: "official" });
+  store.createGroup({ name: "方案评审", members: [a.id, b.id] });
+  const repo = mkdtempSync(join(tmpdir(), "bot-demo-repo-"));
+  const run = (...args: string[]) => execFileSync("git", args, { cwd: repo });
+  run("init", "-q", "-b", "main");
+  writeFileSync(join(repo, "README.md"), "demo\n");
+  run("add", "-A");
+  run("-c", "user.name=demo", "-c", "user.email=demo@localhost", "commit", "-q", "-m", "init");
+  store.createBot({ name: "Chief", role: "调度。DEMO:Chief", agent: "claude", model: "claude-opus-5-5", effort: "medium", permission: "read_only", route: "official", budget_tokens: 300000, is_chief: 1, cwd: repo });
+}
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const app = createApp({

@@ -69,6 +69,7 @@ export const SETTING_DEFAULTS = {
   max_depth: 3,
   max_calls: 10,
   max_active: 3,
+  task_timeout_minutes: 30,
   low_quota: 20,
   quota_refresh_minutes: 2,
 };
@@ -169,6 +170,8 @@ export class Store {
     if (!has("bots", "can_call")) this.db.exec("ALTER TABLE bots ADD COLUMN can_call TEXT");
     if (!has("bots", "is_chief")) this.db.exec("ALTER TABLE bots ADD COLUMN is_chief INTEGER NOT NULL DEFAULT 0");
     if (!has("bots", "paused")) this.db.exec("ALTER TABLE bots ADD COLUMN paused INTEGER NOT NULL DEFAULT 0");
+    for (const [c, type] of [["reason", "TEXT"], ["chain", "TEXT"], ["depends_on", "TEXT"], ["retry_of", "TEXT"], ["timeout_ms", "INTEGER"]]) if (!has("calls", c)) this.db.exec(`ALTER TABLE calls ADD COLUMN ${c} ${type}`);
+    this.db.exec("CREATE INDEX IF NOT EXISTS calls_task ON calls(root_conv_id, mode, created_at); CREATE INDEX IF NOT EXISTS calls_retry ON calls(retry_of);");
     if (has("conversations", "kind")) return;
     // bot_id must become nullable for group conversations, which SQLite can only do by rebuilding the table.
     this.db.exec(`
@@ -346,18 +349,40 @@ export class Store {
     return this.db.prepare("SELECT * FROM root_turns WHERE conv_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(convId) as Row | undefined;
   }
 
-  addCall(c: { id: string; rootTurnId: string; rootConvId: string; callerConvId: string; childConvId: string | null; parentCallId: string | null; from: string; to: string; mode: string; depth: number; question: string; status: string; answer?: string }) {
+  addCall(c: { id: string; rootTurnId: string; rootConvId: string; callerConvId: string; childConvId: string | null; parentCallId: string | null; from: string; to: string; mode: string; depth: number; question: string; status: string; answer?: string; reason?: string; chain?: string[]; dependsOn?: string[]; retryOf?: string; timeoutMs?: number }) {
     this.db
-      .prepare("INSERT INTO calls (id,root_turn_id,root_conv_id,caller_conv_id,child_conv_id,parent_call_id,from_bot,to_bot,mode,depth,question,answer,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-      .run(c.id, c.rootTurnId, c.rootConvId, c.callerConvId, c.childConvId, c.parentCallId, c.from, c.to, c.mode, c.depth, c.question, c.answer ?? null, c.status, Date.now());
+      .prepare("INSERT INTO calls (id,root_turn_id,root_conv_id,caller_conv_id,child_conv_id,parent_call_id,from_bot,to_bot,mode,depth,question,answer,status,reason,chain,depends_on,retry_of,timeout_ms,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(c.id, c.rootTurnId, c.rootConvId, c.callerConvId, c.childConvId, c.parentCallId, c.from, c.to, c.mode, c.depth, c.question, c.answer ?? null, c.status, c.reason ?? null, c.chain ? JSON.stringify(c.chain) : null, c.dependsOn?.length ? JSON.stringify(c.dependsOn) : null, c.retryOf ?? null, c.timeoutMs ?? null, Date.now());
   }
 
-  finishCall(id: string, status: string, answer: string, tokens: number) {
-    this.db.prepare("UPDATE calls SET status=?, answer=?, tokens=?, ended_at=? WHERE id=?").run(status, answer, tokens, Date.now(), id);
+  startCall(id: string) {
+    this.db.prepare("UPDATE calls SET status='running' WHERE id=?").run(id);
+  }
+
+  finishCall(id: string, status: string, answer: string, tokens: number, reason: string | null = null) {
+    this.db.prepare("UPDATE calls SET status=?, answer=?, tokens=?, reason=?, ended_at=? WHERE id=?").run(status, answer, tokens, reason, Date.now(), id);
   }
 
   getCall(id: string) {
     return this.db.prepare("SELECT * FROM calls WHERE id=?").get(id) as Row | undefined;
+  }
+
+  // A retry is a new row, so each attempt stays accounted to the round that paid for it.
+  latestAttempt(id: string) {
+    let cur = this.getCall(id);
+    for (let next = cur; next; next = this.db.prepare("SELECT * FROM calls WHERE retry_of=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(next.id as string) as Row | undefined) cur = next;
+    return cur;
+  }
+
+  attemptNumber(id: string) {
+    let n = 1;
+    for (let cur = this.getCall(id); cur?.retry_of; cur = this.getCall(cur.retry_of as string)) n++;
+    return n;
+  }
+
+  listTasks(convId: string | null, limit: number) {
+    const where = convId ? "AND c.root_conv_id=?" : "";
+    return this.db.prepare(`SELECT c.*, v.title conv_title, v.kind conv_kind, v.bot_id conv_bot_id, v.group_id conv_group_id FROM calls c JOIN conversations v ON v.id=c.root_conv_id WHERE c.mode='task' AND v.archived=0 ${where} ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?`).all(...(convId ? [convId, limit] : [limit])) as Row[];
   }
 
   listCalls(rootTurnId: string) {
@@ -417,8 +442,10 @@ export class Store {
     this.db.prepare("UPDATE items SET status='interrupted', updated_at=? WHERE status='streaming' OR (type='tool' AND status='running')").run(now);
     this.db.prepare("UPDATE items SET status='expired', updated_at=? WHERE type='approval' AND status='pending'").run(now);
     this.db.prepare("UPDATE conversations SET status='idle' WHERE status='running'").run();
-    this.db.prepare("UPDATE calls SET status='interrupted', ended_at=? WHERE status='running'").run(now);
-    this.db.prepare("UPDATE items SET status='interrupted', updated_at=? WHERE type='call' AND status='running'").run(now);
+    // Nothing can pick these up: the agent working on them is gone. A person can retry a task, which resumes its session.
+    const reason = "守护进程重启时还没结束，agent 进程已随之退出，不会再继续";
+    this.db.prepare("UPDATE calls SET status='interrupted', reason=?, answer=COALESCE(answer, ?), ended_at=? WHERE status IN ('running','waiting')").run(reason, reason, now);
+    this.db.prepare("UPDATE items SET status='interrupted', data=json_set(data, '$.answer', ?), updated_at=? WHERE type='call' AND status IN ('running','waiting')").run(reason, now);
     this.db.prepare("UPDATE root_turns SET status='interrupted' WHERE status='running'").run();
     const visible = (this.db.prepare("SELECT id FROM conversations WHERE kind IN ('direct','group')").all() as Row[]).map((r) => r.id as string);
     return stuck.filter((id) => visible.includes(id));

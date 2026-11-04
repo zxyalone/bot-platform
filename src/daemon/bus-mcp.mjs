@@ -28,8 +28,18 @@ const tools = [
   },
   {
     name: "assign_task",
-    description: "把任务交给另一个 Bot 并立刻返回 task_id，可以同时派给多个 Bot。结束本轮前必须用 get_task 取回结果，否则未完成的任务会被取消。",
-    inputSchema: { type: "object", properties: { bot, task: { type: "string" }, ...place }, required: ["bot", "task"] },
+    description: "把任务交给另一个 Bot 并立刻返回 task_id，可以同时派给多个 Bot。结束本轮前必须用 get_task 取回结果，否则未完成的任务会被取消。用户能在任务中心看到它们。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot,
+        task: { type: "string" },
+        depends_on: { type: "array", items: { type: "string" }, description: "要先完成的 task_id。这些任务完成后它才开始，并能看到它们的结论；其中一个没完成，它就不会开始" },
+        timeout_seconds: { type: "number", description: "运行超过这么久就停止，等用户审批的时间不算。只能比平台设置的上限短" },
+        ...place,
+      },
+      required: ["bot", "task"],
+    },
   },
   {
     name: "remember",
