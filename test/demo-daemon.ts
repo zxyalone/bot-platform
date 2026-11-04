@@ -58,8 +58,20 @@ class Scripted implements AgentRuntime {
     const e = this.o.onEvent;
     e({ type: "usage_tick", tokens: 2500 });
     const name = this.o.systemPrompt.match(/DEMO:(\w+)/)?.[1];
-    if (name === "Chief") {
-      if (/改文件/.test(prompt)) {
+    if (/^接手 /.test(prompt)) {
+      await this.stream("我先看看现状，确认上一位做到哪了，再接着做。这是脚本回复，没有消耗额度。");
+    } else if (name === "Chief") {
+      if (/会失败/.test(prompt) && !/重试上一步/.test(prompt)) {
+        // Fails after leaving a change behind, and works when retried, so all three recovery buttons can be tried.
+        await this.stream("我先改一个文件，再跑后面的步骤。");
+        writeFileSync(join(this.o.cwd, "half_done.py"), "# 只写了一半\n");
+        e({ type: "tool", key: "edit", title: "写入 half_done.py", status: "done", files: [join(this.o.cwd, "half_done.py")] });
+        e({ type: "turn_end", status: "failed", error: "连接模型服务时断开了（脚本模拟的失败）" });
+        return;
+      }
+      if (/会失败/.test(prompt)) {
+        await this.stream("这次走通了。之前写了一半的 half_done.py 我确认过还在，接着做完了。");
+      } else if (/改文件/.test(prompt)) {
         await this.stream("我来改两个文件，再跑一次测试。这段时间可以试试排队或立即补充。");
         const file = join(this.o.cwd, "boundary_loss.py");
         e({ type: "tool", key: "edit", title: "写入 boundary_loss.py", status: "running", files: [file] });

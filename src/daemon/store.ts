@@ -396,6 +396,20 @@ export class Store {
     }
   }
 
+  // Only conversations the sidebar can still open: archiving a Bot or group leaves its conversations unmarked.
+  listInbox(limit: number) {
+    return this.db
+      .prepare(
+        `SELECT i.id, i.type, i.data, i.conv_id, i.created_at, v.title conv_title, v.bot_id, v.group_id
+         FROM items i JOIN conversations v ON v.id=i.conv_id
+         LEFT JOIN bots b ON b.id=v.bot_id LEFT JOIN groups g ON g.id=v.group_id
+         WHERE v.archived=0 AND ((v.kind='direct' AND b.archived=0) OR (v.kind='group' AND g.archived=0))
+           AND ((i.type='approval' AND i.status='pending') OR (i.type='queued' AND i.status='unsent') OR (i.type='result' AND COALESCE(json_extract(i.data, '$.accepted'), 0)=0))
+         ORDER BY i.created_at DESC, i.seq DESC LIMIT ?`,
+      )
+      .all(limit) as Row[];
+  }
+
   listItems(convId: string): Item[] {
     return (this.db.prepare("SELECT * FROM items WHERE conv_id=? ORDER BY seq").all(convId) as Row[]).map(toItem);
   }

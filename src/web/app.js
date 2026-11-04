@@ -4,6 +4,7 @@ import { icon } from "./icons.js";
 import { mountResearch } from "./research.js";
 import { mountSettings } from "./settings.js";
 import { mountTasks, TASK_STATUS } from "./tasks.js";
+import { mountInbox } from "./inbox.js";
 
 const AGENT_LABEL = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", antigravity: "Antigravity" };
 const EFFORT_LABEL = { low: "低", medium: "中", high: "高" };
@@ -242,6 +243,7 @@ function handleEvent(ev) {
     case "item": {
       // What a task is waiting on includes approvals, which do not touch its call.
       if (ev.item.type === "approval") refreshTasksPage();
+      if (INBOX_TYPES.includes(ev.item.type)) refreshInbox();
       if (ev.item.conv_id !== state.convId) {
         if (ev.item.type === "approval") renderSidebar();
         return;
@@ -306,6 +308,7 @@ function handleEvent(ev) {
       return;
     }
     case "group_archived": {
+      refreshInbox();
       state.groups = state.groups.filter((g) => g.id !== ev.groupId);
       if (state.groupId === ev.groupId) {
         state.groupId = null;
@@ -341,12 +344,14 @@ function handleEvent(ev) {
       return;
     }
     case "bot_archived": {
+      refreshInbox();
       state.bots = state.bots.filter((b) => b.id !== ev.botId);
       if (state.botId === ev.botId) selectBot(state.bots[0]?.id ?? null);
       else renderSidebar();
       return;
     }
     case "conversation_archived": {
+      refreshInbox();
       const owner = ev.groupId ? state.groups.find((g) => g.id === ev.groupId) : state.bots.find((b) => b.id === ev.botId);
       if (owner) owner.conversations = owner.conversations.filter((c) => c.id !== ev.convId);
       if (state.convId === ev.convId) newConversation();
@@ -375,6 +380,24 @@ async function refreshWorktrees() {
   }
 }
 
+const INBOX_TYPES = ["approval", "queued", "result"];
+let inboxTimer = 0;
+function refreshInbox() {
+  clearTimeout(inboxTimer);
+  inboxTimer = setTimeout(loadInbox, 200);
+}
+async function loadInbox() {
+  try {
+    const { items } = await api("/api/inbox");
+    const changed = items.length !== state.inbox?.length;
+    state.inbox = items;
+    if (changed) renderSidebar();
+    if (state.view === "inbox") state.page?.update(items);
+  } catch {
+    // The connection banner already says so; the count just stays as it was.
+  }
+}
+
 let tasksTimer = 0;
 function refreshTasksPage() {
   if (state.view !== "tasks") return;
@@ -399,6 +422,7 @@ function refreshTrace() {
 }
 
 async function refreshAll() {
+  void loadInbox();
   try {
     const s = await api("/api/state");
     state.bots = s.bots;
@@ -573,7 +597,7 @@ function renderSidebar() {
     h("div", { class: "bot-list" }, groupRows.length ? groupRows : h("p", { class: "empty-hint" }, "把几个 Bot 拉进群聊，需要谁就 @ 谁。")),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "Bots"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建 Bot", title: "新建 Bot", onclick: () => openBotDialog() }, icon("plus", 16))),
     h("div", { class: "bot-list" }, rows.length ? rows : h("p", { class: "empty-hint" }, "还没有 Bot，先建一个。")),
-    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
+    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", state.inbox?.length ? h("span", { class: "inbox-count", "aria-label": `${state.inbox.length} 项待处理` }, String(state.inbox.length)) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
   );
 }
 
@@ -690,6 +714,40 @@ function openResearch() {
       dlg.showModal();
     },
   });
+}
+
+function openInbox() {
+  saveDraft();
+  state.view = "inbox";
+  state.sidebarOpen = false;
+  $("app").classList.remove("sidebar-open");
+  $("app").classList.add("full-page");
+  state.page = mountInbox($("main"), {
+    h,
+    items: state.inbox,
+    onBack: () => {
+      leaveResearch();
+      render({ focus: true });
+    },
+    onOpen: jumpToItem,
+  });
+  renderSidebar();
+  void loadInbox();
+}
+
+async function jumpToItem(entry) {
+  await (entry.group_id ? selectGroup(entry.group_id, entry.conv_id) : selectBot(entry.bot_id, entry.conv_id));
+  // Selecting falls back to the newest conversation when it cannot find this one.
+  const node = state.convId === entry.conv_id ? document.querySelector(`[data-item="${entry.id}"]`) : null;
+  if (!node) {
+    state.sendError = "没有找到这条待办，它可能刚刚处理完，或者对话已经不在了";
+    renderComposerState();
+    void loadInbox();
+    return;
+  }
+  node.scrollIntoView({ block: "center" });
+  node.classList.add("item-flash");
+  setTimeout(() => node.classList.remove("item-flash"), 2000);
 }
 
 function openTasks() {
@@ -960,7 +1018,7 @@ function renderQueue() {
     ...list.map((i) =>
       h(
         "div",
-        { class: `queued-row ${i.status}` },
+        { "data-item": i.id, class: `queued-row ${i.status}` },
         h("span", { class: "chip" }, i.status === "queued" ? "排队中" : "没有发出"),
         h("span", { class: "queued-text", title: i.data.reason ?? i.data.text }, i.data.text),
         h("button", { type: "button", onclick: () => withdrawQueued(i) }, i.status === "queued" ? "撤回" : "放回输入框"),
@@ -1054,6 +1112,13 @@ async function openResultDiff(item) {
   }
 }
 
+// Adds to what is already being typed, because the person did not ask to lose that.
+function addToComposer(text) {
+  const box = $("composer-input");
+  if (!box) return;
+  fillComposer(box.value.trim() ? `${box.value.trimEnd()}\n${text}` : text);
+}
+
 function fillComposer(text) {
   const box = $("composer-input");
   if (!box) return;
@@ -1101,6 +1166,8 @@ function appendItemNode(item) {
   const node = itemNode(item);
   if (node) log.append(node);
   renderComposerState();
+  // A new message makes the retry on an earlier failure out of date.
+  if (item.type === "user") for (const e of state.items) if (e.type === "error") replaceItemNode(e);
   stickToBottom(log, near || item.type === "user" || item.type === "approval");
 }
 
@@ -1183,7 +1250,7 @@ function itemNode(item) {
     case "notice":
       return h("div", { ...attrs, class: "turn-summary" }, `平台通知：${String(d.text ?? "").split("\n")[0]}`);
     case "error":
-      return h("div", { ...attrs, class: "error-card", role: "alert" }, d.bot ? `${d.bot.name}：${d.message}` : d.message);
+      return errorNode(item, attrs);
     case "turn_summary": {
       const parts = [];
       if (d.bot) parts.push(d.bot.name);
@@ -1196,6 +1263,93 @@ function itemNode(item) {
     default:
       return null;
   }
+}
+
+function errorNode(item, attrs) {
+  const d = item.data;
+  const text = d.bot ? `${d.bot.name}：${d.message}` : d.message;
+  if (d.noRecover) return h("div", { ...attrs, class: "error-card", role: "alert" }, text);
+  const openHandoff = (r) => {
+    const bot = botById(r.botId);
+    if (bot) selectBot(bot.id, r.convId);
+  };
+  const r = d.recovery;
+  return h(
+    "div",
+    { ...attrs, class: "error-card", role: "alert" },
+    h("div", {}, text),
+    r
+      ? h("div", { class: "error-recovery" }, h("span", { class: "chip" }, r.action === "handoff" ? `已交给 ${r.bot}` : "已重试"), r.action === "handoff" ? h("button", { type: "button", class: "link-btn", onclick: () => openHandoff(r) }, "打开接手的对话") : null)
+      : h(
+          "div",
+          { class: "approval-actions" },
+          canRetry(item) ? h("button", { type: "button", title: "再跑一次失败的这一步，预算、调用限制和审批照常生效。这一轮已经结束时会新开一轮，占用一份每轮预算", onclick: (e) => retryFailure(item, e.currentTarget) }, "重试这一步") : null,
+          h("button", { type: "button", onclick: () => openHandoffDialog(item) }, "换 Bot 接手"),
+          h("button", { type: "button", onclick: () => addToComposer(`${d.bot ? `@${d.bot.name} ` : ""}补充信息：`) }, "补充信息"),
+        ),
+  );
+}
+
+// The daemon decides; this only hides a button it would certainly refuse.
+function canRetry(item) {
+  const d = item.data;
+  if (d.callId) return d.callMode === "task";
+  if (!d.requestItemId) return false;
+  const at = state.items.findIndex((i) => i.id === item.id);
+  return at >= 0 && !state.items.slice(at + 1).some((i) => i.type === "user");
+}
+
+// A failure inside an opened call card is not in state.items, so its card is redrawn from the reply.
+function showRecovered(item) {
+  document.querySelector(`[data-item="${item.id}"]`)?.replaceWith(itemNode(item));
+}
+
+async function retryFailure(item, button) {
+  button.disabled = true;
+  try {
+    showRecovered(await api(`/api/items/${item.id}/retry`, { method: "POST", body: {} }));
+    state.sendError = null;
+  } catch (e) {
+    button.disabled = false;
+    state.sendError = `不能重试：${e.message}`;
+  }
+  renderComposerState();
+}
+
+function openHandoffDialog(item) {
+  const dlg = $("bot-dialog");
+  const failed = item.data.bot?.id ?? (item.conv_id === state.convId ? currentBot()?.id : null);
+  const from = item.conv_id === state.convId ? currentConv()?.cwd : null;
+  const error = h("p", { class: "result-failed small", role: "alert", hidden: true });
+  const choose = async (bot, button) => {
+    button.disabled = true;
+    try {
+      const { item: updated } = await api(`/api/items/${item.id}/handoff`, { method: "POST", body: { botId: bot.id } });
+      showRecovered(updated);
+      dlg.close();
+    } catch (e) {
+      button.disabled = false;
+      error.textContent = e.message;
+      error.hidden = false;
+    }
+  };
+  const row = (b) => {
+    const note = from === undefined || from === null ? "工作目录可能不同，不一定看得到上一位的改动" : from === b.cwd ? "工作目录相同" : `工作目录不同（${b.cwd}），看不到上一位的改动`;
+    return h("button", { type: "button", class: "handoff-row", onclick: (e) => choose(b, e.currentTarget) }, h("span", { class: "handoff-name" }, avatar(b.id, 22), b.name, b.paused ? h("span", { class: "tag muted-tag" }, "已暂停") : null), h("span", { class: "muted small" }, note));
+  };
+  const bots = state.bots.filter((b) => b.id !== failed);
+  dlg.replaceChildren(
+    h(
+      "div",
+      {},
+      h("h2", {}, "换 Bot 接手"),
+      h("p", { class: "muted small" }, "会和它新开一个对话，把原来的请求、失败原因和平台记录到的改动写给它。上一位的会话上下文带不过去，它要先检查现状。这会占用它的一份每轮预算，审批按它自己的设置。"),
+      bots.length ? h("div", { class: "handoff-list" }, bots.map(row)) : h("p", { class: "muted" }, "没有别的 Bot 可以接手。"),
+      error,
+      h("div", { class: "dialog-actions" }, h("span", { class: "spacer" }), h("button", { type: "button", onclick: () => dlg.close() }, "取消")),
+    ),
+  );
+  dlg.showModal();
 }
 
 const CALL_STATUS = TASK_STATUS;

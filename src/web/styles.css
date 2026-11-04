@@ -186,6 +186,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .side-settings { justify-content: flex-start; width: 100%; border: 0; background: transparent; color: var(--muted); padding: 6px 6px; border-radius: 8px; font-size: 0.88rem; }
 .side-settings:hover { background: var(--hover); color: var(--text); }
 .side-settings.on { background: var(--accent-soft); color: var(--accent-text); }
+.inbox-count { margin-left: auto; min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-line); font-size: 0.72rem; line-height: 16px; text-align: center; }
 
 /* ---------- bars ---------- */
 .bar, .budget-bar { height: 5px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
@@ -288,6 +289,17 @@ summary::-webkit-details-marker { display: none; }
 .activity-stale { flex-basis: 100%; color: var(--warning); font-size: 0.76rem; }
 .queue-strip { display: flex; flex-direction: column; gap: 4px; margin: 0 0 8px; }
 .queue-strip[hidden] { display: none; }
+.error-card .approval-actions { margin-top: 8px; white-space: normal; }
+.error-recovery { display: flex; align-items: center; gap: 8px; margin-top: 6px; white-space: normal; }
+.handoff-list { display: grid; gap: 6px; margin: 10px 0; }
+.handoff-row { display: grid; gap: 2px; justify-content: start; justify-items: start; width: 100%; padding: 8px 10px; text-align: left; }
+.handoff-name { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+@keyframes item-flash { 0%, 60% { outline-color: var(--accent); } 100% { outline-color: transparent; } }
+.item-flash { outline: 2px solid transparent; outline-offset: 2px; animation: item-flash 2s ease-out; }
+.inbox-group + .inbox-group { margin-top: 18px; }
+.inbox-group h2 { margin: 0 0 8px; font-size: 0.9rem; color: var(--muted); font-weight: 600; }
+.inbox-row { display: grid; gap: 2px; justify-content: start; justify-items: start; width: 100%; padding: 9px 12px; margin-bottom: 6px; text-align: left; }
+.inbox-title { overflow-wrap: anywhere; }
 .queued-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 0.8rem; }
 .queued-row.unsent { border-style: dashed; }
 .queued-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

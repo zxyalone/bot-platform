@@ -30,6 +30,8 @@ const pick = (o: any) => Object.fromEntries(PROPOSAL_FIELDS.filter((k) => o?.[k]
 
 // Everything started by one user message: the budget and limits span the whole call tree.
 interface RootTurn {
+  // The person's message that opened this round, if one did.
+  requestItem?: string;
   id: string;
   convId: string;
   limit: number;
@@ -95,6 +97,8 @@ const OUTCOME: Record<string, string> = { done: "完成了", failed: "失败了"
 const DEP_ANSWER = 4000;
 const NOTICE_ANSWER = 2000;
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+const HANDOFF_SAID = 1500;
+const INBOX_LIMIT = 200;
 const firstLine = (s: unknown) => clip(String(s ?? "").trim().split("\n")[0], 60);
 const duration = (ms: number) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.round(ms / 100) / 10} 秒`);
 
@@ -197,7 +201,7 @@ export class Engine {
     this.reaper = setInterval(() => this.reapIdle(), Math.min(o.idleMs ?? 30000, 30000));
     this.reaper.unref();
     for (const convId of this.store.recover()) {
-      this.addItem(convId, null, "error", "done", { message: "守护进程重启时这一轮还没结束，已被中断。可以直接继续发消息。" });
+      this.addItem(convId, null, "error", "done", { message: "守护进程重启时这一轮还没结束，已被中断。可以直接继续发消息。", requestItemId: this.interruptedRequest(convId) });
     }
   }
 
@@ -361,6 +365,116 @@ export class Engine {
     return { base: repo.base.slice(0, 8), diff: diff.slice(0, MAX_RESULT_DIFF), clipped: diff.length > MAX_RESULT_DIFF, untracked, clippedFiles: item!.data.total !== files.length };
   }
 
+  // ---------- recovering from a failure ----------
+  // Nothing was recorded for a round a restart cut off. If it had already reported back, whatever
+  // was interrupted came from the platform waking the Bot, not from the person's last message.
+  private interruptedRequest(convId: string) {
+    const conv = this.store.getConversation(convId);
+    if (conv?.kind !== "direct" && conv?.kind !== "group") return undefined;
+    const items = this.store.listItems(convId);
+    const at = items.findLastIndex((i) => i.type === "user" && !i.data.steered);
+    if (at < 0) return undefined;
+    const later = items.slice(at + 1);
+    const reported = later.some((i) => i.type === "result" || i.type === "notice" || (conv.kind === "direct" && i.type === "turn_summary" && i.status === "completed"));
+    return reported ? undefined : items[at].id;
+  }
+
+  private failureOf(itemId: string) {
+    const item = this.store.getItem(itemId);
+    if (!item || item.type !== "error") throw new HttpError(404, "没有这条错误");
+    if (item.data.noRecover) throw new HttpError(409, "这条提示不是失败，不需要恢复");
+    if (item.data.recovery) throw new HttpError(409, "这个失败已经处理过了");
+    const call = item.data.callId ? this.store.getCall(item.data.callId as string) : undefined;
+    const rootConvId = call ? (call.root_conv_id as string) : item.conv_id;
+    if (!this.store.getConversation(rootConvId) || !this.store.getConversation(item.conv_id)) throw new HttpError(404, "这个对话已归档");
+    return { item, call, rootConvId };
+  }
+
+  // The same doors everything else goes through: retryTask for a task, an ordinary message for a round.
+  async retryFailure(itemId: string) {
+    const { item, call } = this.failureOf(itemId);
+    if (item.data.callId) {
+      if (item.data.callMode !== "task") throw new HttpError(409, "这是 Bot 之间的一次提问，结果已经交回给提问的 Bot。要再做一次，请直接发消息");
+      this.retryTask(call?.id as string);
+      return this.markRecovered(item, { action: "retry" });
+    }
+    if (!item.data.requestItemId) throw new HttpError(409, "这一步不是由你的消息发起的，没有可以重发的内容。可以补充信息后继续");
+    const conv = this.store.getConversation(item.conv_id)!;
+    if (conv.kind !== "direct" && conv.kind !== "group") throw new HttpError(409, "这里不能直接重试");
+    const items = this.store.listItems(conv.id);
+    const at = items.findIndex((i) => i.id === item.id);
+    const from = items.findIndex((i) => i.id === item.data.requestItemId);
+    if (from < 0) throw new HttpError(409, "找不到原来的消息");
+    if (items.slice(at + 1).some((i) => i.type === "user")) throw new HttpError(409, "这之后你已经发过新消息了，重试会把过时的请求再跑一遍");
+    const added = items.slice(from + 1, at).filter((i) => i.type === "user" && i.data.steered).map((i) => `运行中补充：${i.data.text}`);
+    // Everyone this round left failed runs again together, and only them.
+    const failures = conv.kind === "group" ? items.filter((i) => i.type === "error" && i.data.requestItemId === item.data.requestItemId && !i.data.recovery && !i.data.noRecover) : [item];
+    const members = conv.kind === "group" ? this.store.groupMembers(conv.group_id!) : [];
+    const named = failures.map((i) => (i.data.bot as { id: string } | undefined)?.id).filter((id) => id !== undefined);
+    const only = named.length === failures.length ? members.filter((m) => named.includes(m.id)) : undefined;
+    if (only && only.length !== new Set(named).size) throw new HttpError(409, "失败的成员已经不在这个群里了");
+    const body = [`重试上一步。上一次失败：${firstLine(item.data.message)}。之前做的可能已经留下了，先确认再继续。`, `原来的请求：\n${items[from].data.text}`, ...added].join("\n\n");
+    const text = only ? `${only.map((m) => `@${m.name}`).join(" ")} ${body}` : body;
+    // Runs synchronously up to marking the conversation running, so a double click gets a 409.
+    await this.dispatch(conv, text, only);
+    for (const f of failures) if (f.id !== item.id) this.markRecovered(f, { action: "retry" });
+    return this.markRecovered(item, { action: "retry" });
+  }
+
+  // A new conversation, so it takes the target's own folder, budget and approvals. What the prompt
+  // says is limited to what the platform recorded, and the previous Bot's words are marked as such.
+  async handOffFailure(itemId: string, botId: unknown) {
+    const { item, call, rootConvId } = this.failureOf(itemId);
+    const target = typeof botId === "string" ? this.store.getBot(botId) : undefined;
+    if (!target) throw new HttpError(404, "Bot 不存在");
+    const conv = this.store.getConversation(item.conv_id)!;
+    const failedId = (item.data.bot as { id: string } | undefined)?.id ?? conv.bot_id ?? null;
+    if (target.id === failedId) throw new HttpError(409, "这个 Bot 就是失败的那个，换一个，或者用重试");
+    const failedName = failedId ? (this.store.getBot(failedId)?.name ?? "上一位 Bot") : "上一位 Bot";
+    const items = this.store.listItems(conv.id);
+    const at = items.findIndex((i) => i.id === item.id);
+    const request = call ? (call.question as string) : items.find((i) => i.id === item.data.requestItemId)?.data.text;
+    const said = items.slice(0, at).findLast((i) => i.type === "assistant" && (!item.data.bot || (i.data.bot as { id?: string } | undefined)?.id === failedId) && String(i.data.text ?? "").trim());
+    // This round's card, not the card of a later round the person has since started.
+    const since = this.store.listItems(rootConvId).filter((i) => i.created_at >= item.created_at);
+    const nextMessage = since.findIndex((i) => i.type === "user");
+    const card = (nextMessage < 0 ? since : since.slice(0, nextMessage)).find((i) => i.type === "result");
+    const reported = items.slice(0, at).filter((i) => i.type === "tool" && i.data.editing && i.status !== "failed").map((i) => clip(String(i.data.title), 100));
+    const files = (card?.data.files as { path: string; change: string }[] | undefined) ?? [];
+    const changes = files.length ? `${files.map((f) => `${f.change} ${f.path}`).join("\n")}${card!.data.source === "git" ? "\n（平台用 Git 看到的）" : "\n（Bot 的工具上报的，Git 里没有看到）"}` : reported.length ? `${[...new Set(reported)].join("\n")}\n（Bot 的工具上报的，没有核对过）` : "平台没有记录到文件改动，这不代表一定没有改动。";
+    const worktree = this.store.listWorktrees(rootConvId).find((w) => conv.cwd === w.path || conv.cwd.startsWith(`${w.path}/`));
+    const sameDir = conv.cwd === target.cwd;
+    const text = [
+      `接手 ${failedName} 失败的工作`,
+      `${failedName} 失败了，它的会话上下文没有带过来，你只能依靠下面的信息和磁盘上实际存在的东西。`,
+      `原来的请求：\n${request ?? "（平台没有记录）"}`,
+      `失败原因：\n${item.data.message}`,
+      said ? `${failedName} 最后说的话（它的自述，没有核实，也可能没做完）：\n${clip(String(said.data.text).trim(), HANDOFF_SAID)}` : `${failedName} 失败前没有留下文字。`,
+      `记录到的改动：\n${changes}`,
+      worktree ? `${failedName} 在工作树 ${worktree.branch} 里工作，路径 ${worktree.path}，状态 ${worktree.status}。改动没有合并时不在你的目录里。` : null,
+      sameDir ? `工作目录和 ${failedName} 相同：${target.cwd}` : `工作目录不同：${failedName} 在 ${conv.cwd}，你在 ${target.cwd}。你看不到它在那边留下的改动。`,
+      "请先检查现状，确认哪些做了、哪些没做，不要假定任何工作已经完成。缺信息就直接问用户。",
+    ].filter(Boolean).join("\n\n");
+    // The conversation is created inside sendMessage, after the last check that can refuse.
+    const next = await this.sendMessage(target.id, null, text);
+    return { item: this.markRecovered(item, { action: "handoff", convId: next.id, botId: target.id, bot: target.name }), conversation: next };
+  }
+
+  private markRecovered(item: Item, recovery: Record<string, unknown>) {
+    return this.updateItem(item.id, { data: { ...this.store.getItem(item.id)!.data, recovery } });
+  }
+
+  // ---------- what is waiting for the person ----------
+  listInbox() {
+    return this.store.listInbox(INBOX_LIMIT).map((r) => {
+      const d = JSON.parse(r.data as string);
+      const base = { id: r.id, conv_id: r.conv_id, conv_title: r.conv_title, bot_id: r.bot_id, group_id: r.group_id, at: r.created_at };
+      if (r.type === "approval") return { ...base, kind: "approval", title: d.from ? `${d.from}：${d.title}` : d.title };
+      if (r.type === "queued") return { ...base, kind: "unsent", title: clip(String(d.text), 120), detail: d.reason ?? null };
+      return { ...base, kind: "result", title: clip(String(d.summary || (d.total ? `改动了 ${d.total} 个文件` : "这一轮有结果要确认")), 120) };
+    });
+  }
+
   // ---------- messages sent while a round is running ----------
   async followUp(convId: string, text: string, mode: string) {
     const conv = this.store.getConversation(convId);
@@ -391,8 +505,8 @@ export class Engine {
     return { delivered: "queued", itemId: item.id };
   }
 
-  private async dispatch(conv: Conversation, text: string) {
-    return conv.kind === "group" ? this.sendGroupMessage(conv.group_id!, conv.id, text) : this.sendMessage(conv.bot_id!, conv.id, text);
+  private async dispatch(conv: Conversation, text: string, only?: Bot[]) {
+    return conv.kind === "group" ? this.sendGroupMessage(conv.group_id!, conv.id, text, only) : this.sendMessage(conv.bot_id!, conv.id, text);
   }
 
   // Each queued message is an ordinary message, with its own round and budget. True if one was sent.
@@ -431,7 +545,7 @@ export class Engine {
     this.broadcastBudget(root, true);
     if (root.limit > 0 && root.spent >= root.limit && !root.overBudget) {
       root.overBudget = true;
-      this.addItem(root.convId, null, "error", "done", { message: `这一轮已用 ${root.spent} tokens，达到预算 ${root.limit}，已自动暂停。要继续可以再发一条消息，或调高预算。` });
+      this.addItem(root.convId, null, "error", "done", { message: `这一轮已用 ${root.spent} tokens，达到预算 ${root.limit}，已自动暂停。要继续可以再发一条消息，或调高预算。`, requestItemId: root.requestItem });
       this.stopRoot(root, "这一轮的预算用完了，已停止");
     }
   }
@@ -466,18 +580,20 @@ export class Engine {
     if (!conversationId) this.broadcast({ type: "conversation", conversation: conv });
 
     const prompt = this.withNotices(conv.id, text);
-    this.addItem(conv.id, null, "user", "done", { text });
+    const request = this.addItem(conv.id, null, "user", "done", { text });
     this.setConversation(conv.id, { status: "running" });
     const root = this.openRoot(conv.id, bot.budget_tokens);
+    root.requestItem = request.id;
     void this.runTurn(bot, conv.id, prompt, { root, displayConvId: conv.id, depth: 0, chain: [bot.id], callId: null, callPath: [], speaker: null }).finally(() => this.closeRoot(root));
     return this.store.getConversation(conv.id)!;
   }
 
-  async sendGroupMessage(groupId: string, conversationId: string | null, text: string): Promise<Conversation> {
+  // `only` is for a retry: the failed members run again, whatever names the quoted request mentions.
+  async sendGroupMessage(groupId: string, conversationId: string | null, text: string, only?: Bot[]): Promise<Conversation> {
     const group = this.store.getGroup(groupId);
     if (!group) throw new HttpError(404, "群聊不存在");
     const members = this.store.groupMembers(groupId);
-    let mentioned = parseMentions(text, members);
+    let mentioned = only ?? parseMentions(text, members);
     // With a Chief in the group, a message to nobody in particular is a message to the Chief.
     if (!mentioned.length) mentioned = members.filter((m) => m.is_chief);
     if (!mentioned.length) throw new HttpError(400, `请 @ 至少一个成员：${members.map((m) => m.name).join("、")}`);
@@ -487,9 +603,10 @@ export class Engine {
     if (conv.status === "running") throw new HttpError(409, "这个对话还在回复中");
     if (!conversationId) this.broadcast({ type: "conversation", conversation: conv });
 
-    this.addItem(conv.id, null, "user", "done", { text });
+    const request = this.addItem(conv.id, null, "user", "done", { text });
     this.setConversation(conv.id, { status: "running" });
     const root = this.openRoot(conv.id, group.budget_tokens);
+    root.requestItem = request.id;
     void this.runGroupRound(group, conv, mentioned, members, root).finally(() => this.closeRoot(root));
     return this.store.getConversation(conv.id)!;
   }
@@ -812,8 +929,13 @@ export class Engine {
   }
 
   private finishTurn(ctx: TurnCtx, turnId: string, status: TurnStatus, error?: string, usage?: Live["usage"], started?: number) {
-    if (status === "failed") this.addItem(ctx.displayConvId, turnId, "error", "done", { message: error ?? "这一轮失败了", ...this.speakerData(ctx) });
+    if (status === "failed") this.addItem(ctx.displayConvId, turnId, "error", "done", { message: error ?? "这一轮失败了", ...this.speakerData(ctx), ...this.failedStep(ctx) });
     this.addItem(ctx.displayConvId, turnId, "turn_summary", status, { ...(usage ?? {}), ms: started ? Date.now() - started : undefined, ...this.speakerData(ctx) });
+  }
+
+  // What a retry of this failure would have to run again.
+  private failedStep(ctx: TurnCtx) {
+    return ctx.callId ? { callId: ctx.callId, callMode: this.store.getCall(ctx.callId)?.mode } : { requestItemId: ctx.root.requestItem };
   }
 
   // ---------- Bot bus ----------
@@ -903,7 +1025,7 @@ export class Engine {
     if (existing?.is_chief) return { text: "Chief 不能修改或暂停自己", isError: true };
     if (tool === "pause_bot") {
       this.store.updateBot(existing!.id, { paused: 1 });
-      this.addItem(ctx.root.convId, l.turnId, "error", "done", { message: `Chief 暂停了 ${existing!.name}。可以在它的设置里恢复。` });
+      this.addItem(ctx.root.convId, l.turnId, "error", "done", { message: `Chief 暂停了 ${existing!.name}。可以在它的设置里恢复。`, noRecover: true });
       this.broadcast({ type: "bots_changed" });
       return { text: `已暂停 ${existing!.name}`, isError: false };
     }

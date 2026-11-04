@@ -23,6 +23,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/settings.js": { file: "settings.js", type: "text/javascript; charset=utf-8" },
   "/research.js": { file: "research.js", type: "text/javascript; charset=utf-8" },
   "/tasks.js": { file: "tasks.js", type: "text/javascript; charset=utf-8" },
+  "/inbox.js": { file: "inbox.js", type: "text/javascript; charset=utf-8" },
   "/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" },
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -329,6 +330,7 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       const conv = new URL(req.url ?? "/", "http://localhost").searchParams.get("conv");
       return json(res, 200, { tasks: engine.listTasks(conv || null) });
     }
+    if (m === "GET" && pathname === "/api/inbox") return json(res, 200, { items: engine.listInbox() });
     if (m === "POST" && parts[1] === "tasks" && parts[2] && parts[3] === "retry") {
       await readJson(req);
       return json(res, 202, engine.retryTask(parts[2]));
@@ -365,6 +367,14 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       if (m === "POST" && parts[3] === "accept") {
         await readJson(req);
         return json(res, 200, engine.acceptResult(parts[2]));
+      }
+      if (m === "POST" && parts[3] === "retry") {
+        await readJson(req);
+        return json(res, 202, await engine.retryFailure(parts[2]));
+      }
+      if (m === "POST" && parts[3] === "handoff") {
+        const { botId } = await readJson(req);
+        return json(res, 202, await engine.handOffFailure(parts[2], botId));
       }
       if (m === "GET" && parts[3] === "diff") return json(res, 200, await engine.resultDiff(parts[2]));
     }
