@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { boot, tempHome } from "../helpers.ts";
+import { Memory } from "../../src/daemon/git.ts";
 import { ensureChief, ensureSeedBots, Store } from "../../src/daemon/store.ts";
 import type { AgentEvent, AgentRuntime, ApprovalDecision, RuntimeOptions } from "../../src/daemon/types.ts";
 
@@ -79,6 +80,63 @@ async function setup(cwd?: string) {
 }
 
 const spec = { name: "Scholar", role: "读论文", agent: "claude", model: "claude-sonnet-5-5", permission: "read_only", budget_tokens: 50000 };
+
+test("moving the data folder updates stored paths, keeps the user's own, and carries project data along", () => {
+  const parent = mkdtempSync(join(tmpdir(), "bot-move-"));
+  const oldHome = join(parent, "old", ".data");
+  const newHome = join(parent, "new", ".data");
+  const elsewhere = mkdtempSync(join(tmpdir(), "bot-userdir-"));
+  const base = { agent: "claude" as const, model: "m", effort: "low" as const, permission: "ask" as const, route: "official" as const };
+  const a = new Store(oldHome);
+  const inside = a.createBot({ ...base, name: "Inside", role: "" });
+  const outside = a.createBot({ ...base, name: "Outside", role: "", cwd: elsewhere });
+  const conv = a.createConversation(inside, "t");
+  a.updateConversation(conv.id, { session_id: "s" });
+  const codexBot = a.createBot({ ...base, name: "Cx", role: "", agent: "codex" });
+  const codexConv = a.createConversation(codexBot, "t");
+  a.updateConversation(codexConv.id, { session_id: "keep" });
+  const outConv = a.createConversation(outside, "t");
+  a.updateConversation(outConv.id, { session_id: "keep-too" });
+  a.db.exec("CREATE TABLE IF NOT EXISTS project_settings (project_id TEXT PRIMARY KEY, test_dir TEXT NOT NULL DEFAULT '', final_eval_command TEXT NOT NULL DEFAULT '', auto_wake INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 0)");
+  a.db.prepare("INSERT INTO project_settings (project_id, enabled) VALUES (?, 1)").run(Memory.projectId(inside.cwd));
+  const mem = join(oldHome, "memory", "projects", Memory.projectId(inside.cwd));
+  mkdirSync(mem, { recursive: true });
+  writeFileSync(join(mem, "MEMORY.md"), "- 项目笔记");
+  a.close();
+  mkdirSync(join(parent, "new"));
+  renameSync(oldHome, newHome);
+
+  const b = new Store(newHome);
+  const moved = b.getBot(inside.id)!;
+  assert.ok(moved.cwd.startsWith(newHome), moved.cwd);
+  assert.equal(b.getBot(outside.id)!.cwd, elsewhere, "the user's own directory is untouched");
+  const c = b.getConversation(conv.id)!;
+  assert.ok(c.cwd.startsWith(newHome));
+  assert.equal(c.session_id, null, "a Claude session cannot follow the move");
+  assert.equal(b.getConversation(codexConv.id)!.session_id, "keep");
+  assert.equal(b.getConversation(outConv.id)!.session_id, "keep-too", "nothing moved, so it still resumes");
+  assert.equal(readFileSync(join(newHome, "memory", "projects", Memory.projectId(moved.cwd), "MEMORY.md"), "utf8"), "- 项目笔记");
+  assert.equal((b.db.prepare("SELECT enabled FROM project_settings WHERE project_id=?").get(Memory.projectId(moved.cwd)) as any).enabled, 1);
+  b.close();
+  const again = new Store(newHome);
+  assert.equal(again.getBot(inside.id)!.cwd, moved.cwd, "a second start changes nothing");
+  again.close();
+});
+
+test("a database from before the location was recorded is still repaired", () => {
+  const parent = mkdtempSync(join(tmpdir(), "bot-move-"));
+  const oldHome = join(parent, "old", ".data");
+  const newHome = join(parent, "new", ".data");
+  const a = new Store(oldHome);
+  const bot = a.createBot({ agent: "codex", model: "m", effort: "low", permission: "ask", route: "official", name: "X", role: "" });
+  a.db.exec("DELETE FROM app_settings WHERE key='_home'");
+  a.close();
+  mkdirSync(join(parent, "new"));
+  renameSync(oldHome, newHome);
+  const b = new Store(newHome);
+  assert.ok(b.getBot(bot.id)!.cwd.startsWith(newHome));
+  b.close();
+});
 
 test("Chief is created once, listed first, and cannot be archived", async () => {
   const home = tempHome();

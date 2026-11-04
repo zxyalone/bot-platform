@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { basename, join } from "node:path";
 import type { Worktree } from "./git.ts";
 import type { Bot, Conversation, Effort, Group, Item, PermissionPreset, Route, AgentKind } from "./types.ts";
 
@@ -88,6 +88,7 @@ export class Store {
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
     this.db.exec(SCHEMA);
     this.migrate();
+    this.relocate();
   }
 
   close() {
@@ -102,6 +103,56 @@ export class Store {
   saveSettings(patch: Partial<AppSettings>) {
     for (const [k, v] of Object.entries(patch)) this.db.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)").run(k, JSON.stringify(v));
     return this.settings();
+  }
+
+  // Bots and conversations store absolute paths, so moving the data folder would strand them
+  // in a directory that no longer exists. Paths outside the data folder are the user's and stay as they are.
+  private relocate() {
+    const row = this.db.prepare("SELECT value FROM app_settings WHERE key='_home'").get() as Row | undefined;
+    const old = row ? (JSON.parse(row.value as string) as string) : this.inferOldHome();
+    if (old && old !== this.home) this.movePaths(old);
+    this.db.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('_home', ?)").run(JSON.stringify(this.home));
+  }
+
+  // Databases from before this was recorded: a Bot's default directory reveals where the data lived.
+  private inferOldHome() {
+    for (const r of this.db.prepare("SELECT cwd FROM bots").all() as Row[]) {
+      const m = String(r.cwd).match(/^(.*)\/workspaces\/[^/]+$/);
+      if (m && m[1] !== this.home && basename(m[1]) === ".data") return m[1];
+    }
+    return null;
+  }
+
+  private movePaths(old: string) {
+    const hasTable = (t: string) => Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(t));
+    const inOld = (p: string) => p === old || p.startsWith(`${old}/`);
+    const moved = (p: string) => this.home + p.slice(old.length);
+    const projectId = (cwd: string) => createHash("sha256").update(cwd).digest("hex").slice(0, 16);
+    const cwds = new Set<string>();
+    for (const t of ["bots", "conversations", "groups"]) for (const r of this.db.prepare(`SELECT DISTINCT cwd FROM ${t}`).all() as Row[]) if (inOld(String(r.cwd))) cwds.add(String(r.cwd));
+
+    this.db.exec("BEGIN");
+    try {
+      // Claude Code files its sessions under the directory they started in, so these cannot resume from the new one.
+      this.db.prepare("UPDATE conversations SET session_id=NULL WHERE agent='claude' AND (cwd=? OR substr(cwd,1,?)=?)").run(old, old.length + 1, `${old}/`);
+      const targets: [string, string][] = [["bots", "cwd"], ["conversations", "cwd"], ["groups", "cwd"], ["worktrees", "path"], ["experiments", "cwd"], ["jobs", "dir"]];
+      for (const [t, c] of targets) {
+        if (!hasTable(t)) continue;
+        this.db.prepare(`UPDATE ${t} SET ${c} = ? || substr(${c}, ?) WHERE ${c} = ? OR substr(${c}, 1, ?) = ?`).run(this.home, old.length + 1, old, old.length + 1, `${old}/`);
+      }
+      // Project memory and experiments are keyed by a hash of the directory, which just changed.
+      for (const cwd of cwds) {
+        const from = projectId(cwd);
+        const to = projectId(moved(cwd));
+        for (const t of ["ideas", "experiments", "project_settings"]) if (hasTable(t)) this.db.prepare(`UPDATE OR IGNORE ${t} SET project_id=? WHERE project_id=?`).run(to, from);
+        const dir = join(this.home, "memory", "projects");
+        if (existsSync(join(dir, from)) && !existsSync(join(dir, to))) renameSync(join(dir, from), join(dir, to));
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
   }
 
   private migrate() {
