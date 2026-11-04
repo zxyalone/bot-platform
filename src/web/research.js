@@ -70,6 +70,13 @@ export function mountResearch(root, ctx) {
     return [...keys].slice(0, 6);
   }
 
+  function codeVersion(commit, dirty, hash, complete) {
+    if (!commit) return "—";
+    if (!dirty) return commit.slice(0, 8);
+    if (!hash) return `${commit.slice(0, 8)} +改动（未留快照）`;
+    return `${commit.slice(0, 8)} +${hash.slice(0, 8)}${complete ? "" : "（快照不完整）"}`;
+  }
+
   function experimentsTab() {
     const { experiments: list, summary, finalEvals } = ui.data;
     if (!list.length) return [h("p", { class: "muted" }, "还没有实验。让 Bot 用 run_experiment 提交，你批准后会在后台运行。")];
@@ -77,7 +84,7 @@ export function mountResearch(root, ctx) {
     const compare = summary.length
       ? [
           h("h3", {}, "按方案汇总（来自脚本写出的指标）"),
-          h("div", { class: "table-wrap" }, h("table", { class: "rs-table" }, h("thead", {}, h("tr", {}, h("th", {}, "方案"), h("th", {}, "类型"), h("th", {}, "次数"), keys.map((k) => h("th", {}, k)))), h("tbody", {}, summary.map((s) => h("tr", {}, h("td", {}, s.name), h("td", {}, ROLE[s.role] ?? s.role), h("td", {}, String(s.runs)), keys.map((k) => h("td", {}, s.metrics[k] ? `${fmt(s.metrics[k].mean)}${s.metrics[k].n > 1 ? ` ± ${s.metrics[k].std.toFixed(4)}` : ""}` : "—"))))))),
+          h("div", { class: "table-wrap" }, h("table", { class: "rs-table" }, h("thead", {}, h("tr", {}, h("th", {}, "方案"), h("th", {}, "类型"), h("th", {}, "配置"), h("th", {}, "代码版本"), h("th", {}, "样本"), keys.map((k) => h("th", {}, k)))), h("tbody", {}, summary.map((s) => h("tr", {}, h("td", {}, s.name), h("td", {}, ROLE[s.role] ?? s.role), h("td", { class: "path", title: JSON.stringify(s.config) }, JSON.stringify(s.config).slice(0, 40)), h("td", { class: "path" }, codeVersion(s.commit, s.dirty, s.code_hash, s.code_complete)), h("td", { title: "同一个种子重复运行只算一个样本，取平均" }, s.seeds === s.runs ? String(s.runs) : `${s.seeds}（共运行 ${s.runs} 次）`), keys.map((k) => h("td", {}, s.metrics[k] ? `${fmt(s.metrics[k].mean)}${s.metrics[k].n > 1 ? ` ± ${s.metrics[k].std.toFixed(4)}` : ""}` : "—"))))))),
         ]
       : [];
     const row = (e) =>
@@ -88,7 +95,7 @@ export function mountResearch(root, ctx) {
         h("td", {}, e.seed ?? "—"),
         h("td", { class: `state-${e.status}` }, STATUS[e.status] ?? e.status),
         keys.map((k) => h("td", {}, fmt(e.metrics?.[k]))),
-        h("td", { class: "path" }, e.commit_hash ? `${e.commit_hash.slice(0, 8)}${e.dirty ? " +改动" : ""}` : "—"),
+        h("td", { class: "path" }, codeVersion(e.commit_hash, e.dirty, e.code_hash, e.code_complete)),
         h("td", {}, e.final_status === "running" ? "评估中" : e.test_metrics ? Object.entries(e.test_metrics).filter(([, v]) => typeof v === "number").map(([k, v]) => `${k} ${fmt(v)}`).join("，") : "—"),
         h(
           "td",

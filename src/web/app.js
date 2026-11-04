@@ -994,6 +994,8 @@ function itemNode(item) {
       const metrics = Object.entries(d.metrics ?? {}).map(([k, v]) => `${k} ${typeof v === "number" ? (Number.isInteger(v) ? v : v.toFixed(4)) : v}`).join("，");
       return h("div", { ...attrs, class: `call-card ${item.status === "running" ? "running" : item.status === "done" ? "done" : "failed"}` }, h("div", { class: "job-line" }, h("span", { class: "call-route" }, `实验：${d.name}`), h("span", { class: "tool-title call-preview" }, [d.seed !== null && d.seed !== undefined ? `种子 ${d.seed}` : "", metrics].filter(Boolean).join(" · ")), h("span", { class: "tool-status" }, label)));
     }
+    case "notice":
+      return h("div", { ...attrs, class: "turn-summary" }, `平台通知：${String(d.text ?? "").split("\n")[0]}`);
     case "error":
       return h("div", { ...attrs, class: "error-card", role: "alert" }, d.bot ? `${d.bot.name}：${d.message}` : d.message);
     case "turn_summary": {

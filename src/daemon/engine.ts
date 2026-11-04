@@ -262,12 +262,12 @@ export class Engine {
   }
 
   // One at a time, so each Bot reads what the previous one just said.
-  private async runGroupRound(group: Group, conv: Conversation, mentioned: Bot[], members: Bot[], root: RootTurn) {
+  private async runGroupRound(group: Group, conv: Conversation, mentioned: Bot[], members: Bot[], root: RootTurn, instruction = "") {
     for (const bot of mentioned) {
       if (root.stopping) return;
       let session = this.store.findChild("member", conv.id, bot.id);
       if (!session || session.agent !== bot.agent) session = this.store.createChild("member", conv.id, bot, conv.cwd, `${group.name} / ${bot.name}`);
-      const prompt = this.groupPrompt(conv.id, session, bot);
+      const prompt = this.groupPrompt(conv.id, session, bot) + instruction;
       const note = `你在群聊“${group.name}”里，身份是 ${bot.name}。成员：${members.map((m) => m.name).join("、")}。用户 @ 到你时才需要回复，直接回应，不用复述别人说过的话。`;
       const before = this.lastSeq(conv.id);
       await this.runTurn(bot, session.id, prompt, { root, displayConvId: conv.id, depth: 0, chain: [bot.id], callId: null, speaker: { id: bot.id, name: bot.name } }, note);
@@ -287,7 +287,7 @@ export class Engine {
       if (by?.id === bot.id) continue;
       if (i.type === "user") lines.push(`[用户]：${i.data.text}`);
       else if (i.type === "assistant" && i.data.text) lines.push(`[${by?.name ?? "Bot"}]：${i.data.text}`);
-      else if (i.type === "job" && i.data.notice) lines.push(`[平台通知]：${i.data.notice}`);
+      else if (i.type === "notice") lines.push(`[平台通知，不是用户发的]：${i.data.text}`);
     }
     const transcript = lines.join("\n\n");
     const clipped = transcript.length > MAX_TRANSCRIPT ? `（更早的内容已省略）\n${transcript.slice(-MAX_TRANSCRIPT)}` : transcript;
@@ -681,8 +681,10 @@ export class Engine {
       const cur = this.store.getItem(e.item_id)!;
       this.updateItem(e.item_id, { status: e.status, data: { ...cur.data, metrics: e.metrics, notice } });
     }
-    if (!e.root_conv_id || !this.research.settings(e.project_id).auto_wake) return;
-    this.wake(e.root_conv_id, notice);
+    if (!e.root_conv_id) return;
+    if (this.research.settings(e.project_id).auto_wake) return this.wake(e.root_conv_id, notice);
+    // Nobody is woken, but whoever a group talks to next should still know.
+    if (this.store.getConversation(e.root_conv_id)?.kind === "group") this.addItem(e.root_conv_id, null, "notice", "done", { text: notice });
   }
 
   // Spends tokens, so it runs under a normal budget, and only after a person approved the experiment.
@@ -693,18 +695,21 @@ export class Engine {
       this.pendingWakes.set(convId, [...(this.pendingWakes.get(convId) ?? []), notice]);
       return;
     }
-    const prompt = `[平台通知，不是用户发的] ${notice}\n\n请根据结果决定下一步。需要用户决定的事就直接汇报，不要自行启动大量新实验。`;
+    const nextStep = "请根据结果决定下一步。需要用户决定的事就直接汇报，不要自行启动大量新实验。";
     if (conv.kind === "group" && conv.group_id) {
       const group = this.store.getGroup(conv.group_id);
       if (!group) return;
       const members = this.store.groupMembers(group.id);
       const target = members.find((m) => m.is_chief) ?? members[0];
       if (!target) return;
+      // Added now rather than when the run ended: no round is open, so this is newer than anything any member has read.
+      this.addItem(convId, null, "notice", "done", { text: notice });
       this.setConversation(convId, { status: "running" });
       const root = this.openRoot(convId, group.budget_tokens);
-      void this.runGroupRound(group, conv, [target], members, root).finally(() => this.closeRoot(root));
+      void this.runGroupRound(group, conv, [target], members, root, `\n\n${nextStep}`).finally(() => this.closeRoot(root));
       return;
     }
+    const prompt = `[平台通知，不是用户发的] ${notice}\n\n${nextStep}`;
     const bot = conv.bot_id ? this.store.getBot(conv.bot_id) : undefined;
     if (!bot || conv.agent !== bot.agent) return;
     this.setConversation(convId, { status: "running" });

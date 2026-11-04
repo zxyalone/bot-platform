@@ -58,7 +58,7 @@ export interface Item {
   conv_id: string;
   turn_id: string | null;
   seq?: number;
-  type: "user" | "assistant" | "tool" | "approval" | "error" | "turn_summary" | "call" | "job";
+  type: "user" | "assistant" | "tool" | "approval" | "error" | "turn_summary" | "call" | "job" | "notice";
   status: string;
   data: Record<string, unknown>;
   created_at: number;

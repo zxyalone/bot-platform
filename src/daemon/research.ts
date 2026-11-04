@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { extname, isAbsolute, join, resolve, sep } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { agentEnv } from "./adapters/process.ts";
 import { HttpError } from "./errors.ts";
 import { git } from "./git.ts";
@@ -32,6 +32,16 @@ const VERDICTS = ["supported", "not_supported"];
 const IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
 const sh = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 const textArg = (v: unknown, max: number) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+const SNAPSHOT_MAX_DIFF = 5_000_000;
+const SNAPSHOT_MAX_FILE = 5 * 1024 * 1024;
+const SNAPSHOT_MAX_FILES = 5000;
+const SNAPSHOT_MAX_HASHED = 256 * 1024 * 1024;
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+const sha256File = (file: string) =>
+  new Promise<string>((res, rej) => {
+    const h = createHash("sha256");
+    createReadStream(file).on("data", (c) => h.update(c)).on("end", () => res(h.digest("hex"))).on("error", rej);
+  });
 
 const run = (cmd: string, args: string[], timeout = 120000) =>
   new Promise<string>((res, rej) => {
@@ -66,19 +76,38 @@ function readMetrics(file: string): Record<string, number> | null {
   }
 }
 
+const sortKeys = (v: any): unknown => (Array.isArray(v) ? v.map(sortKeys) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v);
+
+// Records from before versions were fingerprinted, and failed snapshots, cannot be shown to match anything.
+const codeKey = (e: Row) => e.code_hash ?? (e.dirty ? `unverified:${e.id}` : (e.commit_hash ?? "no-version"));
+
+const average = (v: number[]) => v.reduce((a, b) => a + b, 0) / v.length;
+
+// Only runs of the same thing may share a mean. Any change of plan, command, config or code starts a new row.
+// A data split is compared through the config, which is where a script reads it from.
 export function summarize(exps: Row[]) {
   const groups = new Map<string, Row[]>();
-  for (const e of exps) if (e.status === "done" && e.metrics) groups.set(e.name, [...(groups.get(e.name) ?? []), e]);
-  return [...groups].map(([name, list]) => {
+  for (const e of exps) {
+    if (e.status !== "done" || !e.metrics) continue;
+    const key = JSON.stringify([e.name, e.role, e.idea_id, e.command, sortKeys(e.config), codeKey(e)]);
+    groups.set(key, [...(groups.get(key) ?? []), e]);
+  }
+  return [...groups].map(([key, list]) => {
+    // A seed is one sample however often it is rerun, so rerunning cannot shrink the spread. Without a seed, each run is its own.
+    const samples = new Map<string, Row[]>();
+    for (const e of list) {
+      const s = e.seed === null || e.seed === undefined ? `run:${e.id}` : `seed:${e.seed}`;
+      samples.set(s, [...(samples.get(s) ?? []), e]);
+    }
     const metrics: Record<string, { mean: number; std: number; n: number }> = {};
-    const keys = new Set(list.flatMap((e) => Object.keys(e.metrics)));
-    for (const k of keys) {
-      const v = list.map((e) => e.metrics[k]).filter((x) => typeof x === "number");
-      const mean = v.reduce((a, b) => a + b, 0) / v.length;
+    for (const k of new Set(list.flatMap((e) => Object.keys(e.metrics)))) {
+      const v = [...samples.values()].map((runs) => runs.map((e) => e.metrics[k]).filter((x) => typeof x === "number")).filter((x) => x.length).map(average);
+      const mean = average(v);
       const std = v.length > 1 ? Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / (v.length - 1)) : 0;
       metrics[k] = { mean, std, n: v.length };
     }
-    return { name, role: list[0].role, idea_id: list[0].idea_id, runs: list.length, metrics };
+    const first = list[0];
+    return { group: sha256(key).slice(0, 12), name: first.name, role: first.role, idea_id: first.idea_id, config: first.config, commit: first.commit_hash ?? null, dirty: Boolean(first.dirty), code_hash: first.code_hash ?? null, code_complete: first.code_complete ?? null, runs: list.length, seeds: samples.size, metrics };
   });
 }
 
@@ -111,6 +140,9 @@ export class Research {
     this.onFinished = o.onFinished;
     this.sshPollMs = o.sshPollMs ?? 30000;
     this.db.exec(SCHEMA);
+    const columns = (this.db.prepare("PRAGMA table_info(experiments)").all() as Row[]).map((c) => c.name);
+    if (!columns.includes("code_hash")) this.db.exec("ALTER TABLE experiments ADD COLUMN code_hash TEXT");
+    if (!columns.includes("code_complete")) this.db.exec("ALTER TABLE experiments ADD COLUMN code_complete INTEGER");
     this.timer = setInterval(() => void this.poll(), o.pollMs ?? 2000);
     this.timer.unref();
   }
@@ -252,10 +284,10 @@ export class Research {
     const dir = join(this.store.home, "runs", id);
     mkdirSync(join(dir, "artifacts"), { recursive: true });
     writeFileSync(join(dir, "config.json"), JSON.stringify(r.config, null, 2));
-    const code = await this.codeVersion(r.cwd, dir);
+    const code = await this.codeVersion(r.cwd, dir, this.settings(r.projectId).test_dir);
     this.db
-      .prepare("INSERT INTO experiments (id,project_id,idea_id,name,role,command,config,seed,target,cwd,commit_hash,dirty,status,root_conv_id,bot_name,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'running',?,?,?)")
-      .run(id, r.projectId, r.ideaId, r.name, r.role, r.command, JSON.stringify(r.config), r.seed, r.target, r.cwd, code.commit, code.dirty ? 1 : 0, by.rootConvId, by.botName, Date.now());
+      .prepare("INSERT INTO experiments (id,project_id,idea_id,name,role,command,config,seed,target,cwd,commit_hash,dirty,code_hash,code_complete,status,root_conv_id,bot_name,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'running',?,?,?)")
+      .run(id, r.projectId, r.ideaId, r.name, r.role, r.command, JSON.stringify(r.config), r.seed, r.target, r.cwd, code.commit, code.dirty ? 1 : 0, code.hash, code.complete === null ? null : code.complete ? 1 : 0, by.rootConvId, by.botName, Date.now());
     if (r.ideaId) this.db.prepare("UPDATE ideas SET status='testing', updated_at=? WHERE id=? AND status='proposed'").run(Date.now(), r.ideaId);
     try {
       await this.launch(id, "train", r.target, r.cwd, r.command, dir, { BOT_SEED: r.seed === null ? "" : String(r.seed) });
@@ -268,16 +300,61 @@ export class Research {
     return this.getExperiment(id)!;
   }
 
-  // The commit alone cannot reproduce a run made on uncommitted work, so the diff is kept with it.
-  private async codeVersion(cwd: string, dir: string) {
+  // The commit alone cannot reproduce a run made on uncommitted work, so the changes are kept with it.
+  private async codeVersion(cwd: string, dir: string, testDir: string): Promise<{ commit: string | null; dirty: boolean; hash: string | null; complete: boolean | null }> {
+    let commit: string;
     try {
-      const commit = (await git(cwd, ["rev-parse", "HEAD"])).trim();
-      const dirty = Boolean((await git(cwd, ["status", "--porcelain"])).trim());
-      if (dirty) writeFileSync(join(dir, "code.diff"), (await git(cwd, ["diff", "HEAD"])).slice(0, 5_000_000));
-      return { commit, dirty };
+      commit = (await git(cwd, ["rev-parse", "HEAD"])).trim();
+      if (!(await git(cwd, ["status", "--porcelain"])).trim()) return { commit, dirty: false, hash: commit, complete: true };
     } catch {
-      return { commit: null, dirty: false };
+      return { commit: null, dirty: false, hash: null, complete: null };
     }
+    try {
+      return { commit, dirty: true, ...(await this.snapshot(cwd, dir, commit, testDir)) };
+    } catch (e) {
+      writeFileSync(join(dir, "code.json"), JSON.stringify({ commit, dirty: true, complete: false, error: (e as Error).message }, null, 2));
+      return { commit, dirty: true, hash: null, complete: false };
+    } finally {
+      rmSync(join(dir, ".snapshot-index"), { force: true });
+      rmSync(join(dir, ".snapshot-paths"), { force: true });
+    }
+  }
+
+  // `git diff HEAD` skips files Git has not seen yet, and a new training script is exactly that. A throwaway index
+  // marks them as intended additions, so the patch carries them while the user's index and object store stay untouched.
+  private async snapshot(cwd: string, dir: string, commit: string, testDir: string) {
+    const top = (await git(cwd, ["rev-parse", "--show-toplevel"])).trim();
+    const hidden = testDir && existsSync(testDir) ? realpathSync(testDir) : testDir;
+    const listed = (await git(top, ["ls-files", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean);
+    const files: { path: string; size: number; sha256: string | null; included: boolean }[] = [];
+    let complete = listed.length <= SNAPSHOT_MAX_FILES;
+    for (const path of listed.slice(0, SNAPSHOT_MAX_FILES)) {
+      const full = join(top, path);
+      if (hidden && (full === hidden || full.startsWith(hidden + sep))) continue;
+      const st = lstatSync(full);
+      if (st.isSymbolicLink()) files.push({ path, size: st.size, sha256: sha256(readlinkSync(full)), included: true });
+      else if (st.isFile()) files.push({ path, size: st.size, sha256: st.size <= SNAPSHOT_MAX_HASHED ? await sha256File(full) : null, included: st.size <= SNAPSHOT_MAX_FILE });
+      else files.push({ path, size: st.size, sha256: null, included: false }); // A nested repository.
+      if (!files.at(-1)!.included) complete = false;
+    }
+    const index = join(dir, ".snapshot-index");
+    const current = resolve(top, (await git(top, ["rev-parse", "--git-path", "index"])).trim());
+    if (existsSync(current)) copyFileSync(current, index);
+    const env = { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: "1" };
+    const adding = files.filter((f) => f.included).map((f) => f.path);
+    if (adding.length) {
+      const paths = join(dir, ".snapshot-paths");
+      writeFileSync(paths, adding.join("\0"));
+      await git(top, ["add", "--intent-to-add", `--pathspec-from-file=${paths}`, "--pathspec-file-nul"], env);
+    }
+    // Fixed options, so a user's diff settings cannot change the patch or its hash.
+    const diff = await git(top, ["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", "HEAD"], env);
+    const left = files.filter((f) => !f.included);
+    const hash = sha256(JSON.stringify([commit, sha256(diff), left]));
+    if (diff.length > SNAPSHOT_MAX_DIFF) complete = false;
+    writeFileSync(join(dir, "code.diff"), diff.slice(0, SNAPSHOT_MAX_DIFF));
+    writeFileSync(join(dir, "code.json"), JSON.stringify({ commit, dirty: true, code_hash: hash, complete, diff_bytes: Buffer.byteLength(diff), new_files: listed.length, files: files.slice(0, 1000) }, null, 2));
+    return { hash, complete };
   }
 
   setItem(id: string, itemId: string) {
@@ -288,15 +365,22 @@ export class Research {
     const e = this.getExperiment(id);
     if (!e) throw new HttpError(404, "没有这个实验");
     if (e.status !== "done") throw new HttpError(409, "实验完成后才能做最终评估");
-    if (e.final_status === "running") throw new HttpError(409, "最终评估正在进行");
     const s = this.settings(e.project_id);
     if (!s.final_eval_command) throw new HttpError(400, "请先在设置里填写最终评估命令");
+    // Claimed before the first await: a second click must not start a second look at the test set.
+    if (!this.db.prepare("UPDATE experiments SET final_status='running' WHERE id=? AND final_status IS NOT 'running'").run(id).changes) throw new HttpError(409, "最终评估正在进行");
     const dir = join(this.store.home, "runs", id);
-    const finalDir = join(dir, "final");
-    mkdirSync(finalDir, { recursive: true });
+    // Each evaluation gets its own directory. Sharing one would let the last evaluation's exit file end this one.
+    const finalDir = join(dir, "final", randomUUID().slice(0, 8));
+    mkdirSync(join(finalDir, "artifacts"), { recursive: true });
     const cwd = existsSync(e.cwd) ? e.cwd : dir;
-    await this.launch(id, "final", e.target, cwd, s.final_eval_command, finalDir, { BOT_TEST_DIR: s.test_dir, BOT_TRAIN_RUN_DIR: dir, BOT_CONFIG_FILE: join(dir, "config.json"), BOT_SEED: e.seed === null ? "" : String(e.seed) });
-    this.db.prepare("UPDATE experiments SET final_status='running' WHERE id=?").run(id);
+    try {
+      await this.launch(id, "final", e.target, cwd, s.final_eval_command, finalDir, { BOT_TEST_DIR: s.test_dir, BOT_TRAIN_RUN_DIR: dir, BOT_CONFIG_FILE: join(dir, "config.json"), BOT_SEED: e.seed === null ? "" : String(e.seed) });
+    } catch (err) {
+      this.db.prepare("UPDATE experiments SET final_status=? WHERE id=?").run(e.final_status, id);
+      this.notify(e.project_id);
+      throw new HttpError(500, `启动失败：${(err as Error).message}`);
+    }
     this.notify(e.project_id);
   }
 
@@ -327,7 +411,7 @@ export class Research {
     }
     const t = this.listTargets().find((x) => x.name === target);
     if (!t) throw new Error(`没有计算目标 ${target}`);
-    const remote = `${t.remote_root}/runs/${expId}/${kind}`;
+    const remote = `${t.remote_root}/runs/${expId}/${kind === "final" ? `final/${basename(dir)}` : kind}`;
     const code = `${t.remote_root}/runs/${expId}/code`;
     await run(this.ssh(), [t.ssh_host, `mkdir -p ${sh(`${remote}/artifacts`)} ${sh(code)}`]);
     // Respects .gitignore so datasets and checkpoints in the repository are not copied on every run.
@@ -490,7 +574,7 @@ export class Research {
         return this.listIdeas(projectId).slice(0, 100).map((i) => ({ id: i.id, title: i.title, status: i.status, suggested_verdict: i.suggested_verdict, conclusion: i.conclusion.slice(0, 300), failure_reason: i.failure_reason.slice(0, 300) }));
       case "list_experiments": {
         const list = this.listExperiments(projectId, textArg(args?.idea_id, 40) || undefined).slice(0, 100);
-        return { summary: summarize(list), experiments: list.map((e) => ({ id: e.id, name: e.name, role: e.role, seed: e.seed, status: e.status, commit: e.commit_hash?.slice(0, 8) ?? null, dirty: Boolean(e.dirty), metrics: e.metrics })) };
+        return { summary: summarize(list), experiments: list.map((e) => ({ id: e.id, name: e.name, role: e.role, seed: e.seed, status: e.status, commit: e.commit_hash?.slice(0, 8) ?? null, dirty: Boolean(e.dirty), code: e.code_hash?.slice(0, 8) ?? null, metrics: e.metrics })) };
       }
       case "get_experiment": {
         const e = this.getExperiment(textArg(args?.id, 40));

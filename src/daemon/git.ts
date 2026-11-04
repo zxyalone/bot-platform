@@ -6,9 +6,9 @@ import { agentEnv } from "./adapters/process.ts";
 import { HttpError } from "./errors.ts";
 import type { Store } from "./store.ts";
 
-export function git(cwd: string, args: string[]): Promise<string> {
+export function git(cwd: string, args: string[], env: Record<string, string> = {}): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile("git", args, { cwd, env: { ...agentEnv(), GIT_TERMINAL_PROMPT: "0" }, maxBuffer: 32 * 1024 * 1024, timeout: 120000 }, (e, stdout, stderr) => {
+    execFile("git", args, { cwd, env: { ...agentEnv(), GIT_TERMINAL_PROMPT: "0", ...env }, maxBuffer: 32 * 1024 * 1024, timeout: 120000 }, (e, stdout, stderr) => {
       if (e) reject(new Error(String(stderr || e.message).trim().split("\n").slice(0, 4).join(" ").slice(0, 500)));
       else resolve(stdout);
     });
