@@ -24,6 +24,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/research.js": { file: "research.js", type: "text/javascript; charset=utf-8" },
   "/tasks.js": { file: "tasks.js", type: "text/javascript; charset=utf-8" },
   "/inbox.js": { file: "inbox.js", type: "text/javascript; charset=utf-8" },
+  "/drafts.js": { file: "drafts.js", type: "text/javascript; charset=utf-8" },
   "/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" },
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -331,6 +332,10 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       return json(res, 200, { tasks: engine.listTasks(conv || null) });
     }
     if (m === "GET" && pathname === "/api/inbox") return json(res, 200, { items: engine.listInbox() });
+    if (m === "POST" && parts[1] === "tasks" && parts[2] && parts[3] === "cancel") {
+      await readJson(req);
+      return json(res, 202, engine.cancelTask(parts[2]));
+    }
     if (m === "POST" && parts[1] === "tasks" && parts[2] && parts[3] === "retry") {
       await readJson(req);
       return json(res, 202, engine.retryTask(parts[2]));
@@ -376,6 +381,7 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
         const { botId } = await readJson(req);
         return json(res, 202, await engine.handOffFailure(parts[2], botId));
       }
+      if (m === "POST" && parts[3] === "review") return json(res, 200, engine.reviewResult(parts[2], (await readJson(req)).state));
       if (m === "GET" && parts[3] === "diff") return json(res, 200, await engine.resultDiff(parts[2]));
     }
     if (m === "POST" && parts[1] === "approvals" && parts[2]) {

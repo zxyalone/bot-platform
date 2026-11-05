@@ -5,18 +5,25 @@ const GROUPS = [
   ["approval", "等你批准"],
   ["unsent", "没有发出的消息"],
   ["result", "等你确认的结果"],
+  ["later", "稍后处理"],
 ];
 
 export function mountInbox(root, ctx) {
-  const { h, onBack, onOpen } = ctx;
+  const { h, onBack, onOpen, onReview } = ctx;
   let items = ctx.items ?? null;
 
   const row = (i) =>
     h(
-      "button",
-      { type: "button", class: "inbox-row", onclick: () => onOpen(i) },
-      h("span", { class: "inbox-title" }, i.title),
-      h("span", { class: "muted small" }, [i.conv_title, new Date(i.at).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }), i.detail].filter(Boolean).join(" · ")),
+      "div",
+      { class: "inbox-line" },
+      h(
+        "button",
+        { type: "button", class: "inbox-row", onclick: () => onOpen(i) },
+        h("span", { class: "inbox-title" }, i.title),
+        h("span", { class: "muted small" }, [i.conv_title, new Date(i.at).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }), i.detail].filter(Boolean).join(" · ")),
+      ),
+      i.kind === "result" ? h("button", { type: "button", title: "先放一边，不计入待办数量", onclick: () => onReview(i, "later") }, "稍后处理") : null,
+      i.kind === "result" || i.kind === "later" ? h("button", { type: "button", title: "移出待办。这不代表你接受了结果", onclick: () => onReview(i, "dismissed") }, "无需验收") : null,
     );
 
   function draw() {

@@ -6,11 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { boot, tempHome } from "../helpers.ts";
 import { realFactory } from "../../src/daemon/factory.ts";
+import { CHEAPEST } from "./cheap.ts";
 
 const TURN_MS = 180000;
 const CASES = [
-  { agent: "claude", model: "claude-sonnet-5-5" },
-  { agent: "codex", model: "gpt-6-luna" },
+  { agent: "claude", model: CHEAPEST.claude },
+  { agent: "codex", model: CHEAPEST.codex },
 ];
 
 async function until(t: any, convId: string, check: (d: any) => any, label: string) {

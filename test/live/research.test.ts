@@ -9,6 +9,7 @@ import { boot, tempHome } from "../helpers.ts";
 import { realFactory } from "../../src/daemon/factory.ts";
 import { Memory } from "../../src/daemon/git.ts";
 import { refineRole } from "../../src/daemon/refine.ts";
+import { CHEAPEST } from "./cheap.ts";
 
 const TRAIN = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake_train.mjs");
 
@@ -22,7 +23,7 @@ test("AI refinement returns usable text and follows the draft", { timeout: 12000
 test("an approved experiment runs in the background and its result wakes the agent", { timeout: 300000 }, async () => {
   const t = await boot(realFactory, { home: tempHome() });
   const cwd = mkdtempSync(join(tmpdir(), "bot-live-rs-"));
-  const bot = (await t.api("POST", "/api/bots", { name: "R", role: "你负责跑实验。", agent: "claude", model: "claude-sonnet-5-5", effort: "low", permission: "read_only", cwd, budget_tokens: 80000, can_call: [] })).body;
+  const bot = (await t.api("POST", "/api/bots", { name: "R", role: "你负责跑实验。", agent: "claude", model: CHEAPEST.claude, effort: "low", permission: "read_only", cwd, budget_tokens: 80000, can_call: [] })).body;
   const pid = Memory.projectId(cwd);
   await t.api("PUT", `/api/projects/${pid}/settings`, { enabled: true });
   const command = `"${process.execPath}" "${TRAIN}"`;

@@ -298,6 +298,9 @@ summary::-webkit-details-marker { display: none; }
 .item-flash { outline: 2px solid transparent; outline-offset: 2px; animation: item-flash 2s ease-out; }
 .inbox-group + .inbox-group { margin-top: 18px; }
 .inbox-group h2 { margin: 0 0 8px; font-size: 0.9rem; color: var(--muted); font-weight: 600; }
+.inbox-line { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.inbox-line > button:not(.inbox-row) { flex: none; padding: 3px 8px; font-size: 0.74rem; }
+.inbox-line .inbox-row { flex: 1; min-width: 0; margin-bottom: 0; }
 .inbox-row { display: grid; gap: 2px; justify-content: start; justify-items: start; width: 100%; padding: 9px 12px; margin-bottom: 6px; text-align: left; }
 .inbox-title { overflow-wrap: anywhere; }
 .queued-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 0.8rem; }

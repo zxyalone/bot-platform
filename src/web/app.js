@@ -5,6 +5,7 @@ import { mountResearch } from "./research.js";
 import { mountSettings } from "./settings.js";
 import { mountTasks, TASK_STATUS } from "./tasks.js";
 import { mountInbox } from "./inbox.js";
+import { draftKey as keyFor, loadDrafts, saveDrafts } from "./drafts.js";
 
 const AGENT_LABEL = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", antigravity: "Antigravity" };
 const EFFORT_LABEL = { low: "低", medium: "中", high: "高" };
@@ -26,6 +27,15 @@ function applyAppearance(a) {
   $("app").classList.toggle("no-details", a.details_open === false);
 }
 
+// A browser that refuses storage costs the drafts, not the page.
+const draftStorage = (() => {
+  try {
+    return window.localStorage;
+  } catch {
+    return undefined;
+  }
+})();
+
 const state = {
   settings: null,
   bots: [],
@@ -44,7 +54,7 @@ const state = {
   connected: true,
   loadError: null,
   sidebarOpen: false,
-  drafts: new Map(),
+  drafts: loadDrafts(draftStorage),
   sending: false,
   sendError: null,
 };
@@ -205,9 +215,19 @@ async function loadItems() {
 function saveDraft() {
   // The box remembers its own key: by the time this runs, the selection may have moved on.
   const box = $("composer-input");
-  if (box) state.drafts.set(box.dataset.draftKey, box.value);
+  if (!box) return;
+  // Re-inserted so the map stays in order of use: the oldest are dropped first.
+  state.drafts.delete(box.dataset.draftKey);
+  if (box.value.trim()) state.drafts.set(box.dataset.draftKey, box.value);
+  saveDrafts(draftStorage, state.drafts);
 }
-const draftKey = () => `${state.botId}/${state.convId ?? "new"}`;
+const draftKey = () => keyFor(state);
+let draftTimer = 0;
+function saveDraftSoon() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(saveDraft, 400);
+}
+window.addEventListener("pagehide", saveDraft);
 
 // ---------- server events ----------
 function connectEvents() {
@@ -267,6 +287,8 @@ function handleEvent(ev) {
       return;
     }
     case "budget": {
+      // A round ending changes what a retry would do, and nothing about the task itself has to change for that.
+      if (!ev.active) refreshTasksPage();
       if (ev.convId !== state.convId) return;
       state.trace = { calls: state.trace?.calls ?? [], budget: { spent: ev.spent, limit: ev.limit, active: ev.active } };
       renderDetails();
@@ -382,6 +404,9 @@ async function refreshWorktrees() {
 
 const INBOX_TYPES = ["approval", "queued", "result"];
 let inboxTimer = 0;
+// What was put off for later does not ask for attention.
+const waitingCount = () => (state.inbox ?? []).filter((i) => i.kind !== "later").length;
+
 function refreshInbox() {
   clearTimeout(inboxTimer);
   inboxTimer = setTimeout(loadInbox, 200);
@@ -389,8 +414,9 @@ function refreshInbox() {
 async function loadInbox() {
   try {
     const { items } = await api("/api/inbox");
-    const changed = items.length !== state.inbox?.length;
+    const before = waitingCount();
     state.inbox = items;
+    const changed = waitingCount() !== before;
     if (changed) renderSidebar();
     if (state.view === "inbox") state.page?.update(items);
   } catch {
@@ -597,7 +623,7 @@ function renderSidebar() {
     h("div", { class: "bot-list" }, groupRows.length ? groupRows : h("p", { class: "empty-hint" }, "把几个 Bot 拉进群聊，需要谁就 @ 谁。")),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "Bots"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建 Bot", title: "新建 Bot", onclick: () => openBotDialog() }, icon("plus", 16))),
     h("div", { class: "bot-list" }, rows.length ? rows : h("p", { class: "empty-hint" }, "还没有 Bot，先建一个。")),
-    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", state.inbox?.length ? h("span", { class: "inbox-count", "aria-label": `${state.inbox.length} 项待处理` }, String(state.inbox.length)) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
+    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", waitingCount() ? h("span", { class: "inbox-count", "aria-label": `${waitingCount()} 项待处理` }, String(waitingCount())) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
   );
 }
 
@@ -730,6 +756,7 @@ function openInbox() {
       render({ focus: true });
     },
     onOpen: jumpToItem,
+    onReview: reviewResult,
   });
   renderSidebar();
   void loadInbox();
@@ -910,6 +937,7 @@ function renderComposer(entity) {
     oninput: (e) => {
       autoGrow(e.target);
       updateMention(e.target);
+      saveDraftSoon();
     },
     onblur: () => {
       mention.open = false;
@@ -1057,7 +1085,7 @@ function resultNode(item, attrs) {
   return h(
     "div",
     { ...attrs, class: `result-card ${item.status}` },
-    h("div", { class: "result-head" }, h("strong", {}, ended), d.accepted ? h("span", { class: "chip" }, "你已接受") : null),
+    h("div", { class: "result-head" }, h("strong", {}, ended), d.accepted ? h("span", { class: "chip" }, "你已接受") : d.review === "dismissed" ? h("span", { class: "chip" }, "无需验收") : d.review === "later" ? h("span", { class: "chip" }, "稍后处理") : null),
     d.summary ? h("p", { class: "result-summary" }, h("span", { class: "muted" }, "Bot 自述："), d.summary) : null,
     d.files.length
       ? h(
@@ -1082,9 +1110,21 @@ function resultNode(item, attrs) {
       { class: "approval-actions" },
       d.repo ? h("button", { type: "button", onclick: () => openResultDiff(item) }, "查看改动") : null,
       h("button", { type: "button", onclick: () => fillComposer("请继续修改：") }, "继续修改"),
-      d.accepted ? null : h("button", { type: "button", class: "primary", title: "只记下你看过并接受了，不会合并或提交任何东西", onclick: () => acceptResult(item) }, "接受结果"),
+      d.accepted || d.review === "dismissed" ? null : h("button", { type: "button", class: "primary", title: "只记下你看过并接受了，不会合并或提交任何东西", onclick: () => acceptResult(item) }, "接受结果"),
+      d.accepted || d.review ? null : h("button", { type: "button", title: "先放一边，不计入待办数量", onclick: () => reviewResult(item, "later") }, "稍后处理"),
+      d.accepted || d.review === "dismissed" ? null : h("button", { type: "button", title: "移出待办。这不代表你接受了结果", onclick: () => reviewResult(item, "dismissed") }, "无需验收"),
     ),
   );
+}
+
+async function reviewResult(item, reviewState) {
+  try {
+    await api(`/api/items/${item.id}/review`, { method: "POST", body: { state: reviewState } });
+    loadInbox();
+  } catch (e) {
+    state.sendError = e.message;
+    renderComposerState();
+  }
 }
 
 async function acceptResult(item) {
@@ -1099,12 +1139,13 @@ async function acceptResult(item) {
 async function openResultDiff(item) {
   const dlg = $("bot-dialog");
   const body = h("pre", { class: "diff-view" }, "读取中…");
-  dlg.replaceChildren(h("div", {}, h("h2", {}, "这一轮的改动"), h("p", { class: "muted small" }, "相对这一轮开始时的提交。这些文件在这一轮之前已有的未提交改动也会显示。"), body, h("div", { class: "dialog-actions" }, h("span", { class: "spacer" }), h("button", { type: "button", onclick: () => dlg.close() }, "关闭"))));
+  dlg.replaceChildren(h("div", {}, h("h2", {}, "这一轮的改动"), h("p", { class: "muted small" }, "这一轮结束时保存的内容，之后再改文件也不会变。相对这一轮开始时的提交，所以这些文件之前已有的未提交改动也会显示。"), body, h("div", { class: "dialog-actions" }, h("span", { class: "spacer" }), h("button", { type: "button", onclick: () => dlg.close() }, "关闭"))));
   dlg.showModal();
   try {
     const d = await api(`/api/items/${item.id}/diff`);
-    const extra = d.untracked.length ? `\n新文件：\n${d.untracked.map((f) => `  ${f}`).join("\n")}\n` : "";
-    body.textContent = (d.diff + extra).trim() || "现在已经没有差异了，这些改动可能又被改回去了。";
+    const kb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.ceil(n / 1024)} KB`);
+    const extra = d.skipped.length ? `\n\n太大没有显示内容的新文件（请到工作目录查看）：\n${d.skipped.map((f) => `  ${f.path}（${kb(f.size)}，${f.type}）`).join("\n")}` : "";
+    body.textContent = (d.diff + extra).trim() || "这一轮结束时已经没有差异了，这些改动又被改回去了。";
     if (d.clipped) body.textContent += "\n\n…（改动太长，已截断）";
     if (d.clippedFiles) body.textContent += "\n\n…（文件太多，只比较了前面一部分）";
   } catch (e) {

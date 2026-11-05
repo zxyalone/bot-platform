@@ -6,11 +6,12 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { boot, tempHome } from "../helpers.ts";
 import { realFactory } from "../../src/daemon/factory.ts";
+import { CHEAPEST } from "./cheap.ts";
 
 const TURN_MS = 180000;
 const CASES = [
-  { agent: "claude", model: "claude-sonnet-5-5" },
-  { agent: "codex", model: "gpt-6-luna" },
+  { agent: "claude", model: CHEAPEST.claude },
+  { agent: "codex", model: CHEAPEST.codex },
 ];
 
 async function run(t: any, botId: string, text: string, decide: (a: any) => string, conversationId?: string) {
@@ -62,7 +63,7 @@ test("codex: the gateway route works when the local gateway is running", { timeo
   const up = await fetch("http://127.0.0.1:3425/v1/models").then((r) => r.ok).catch(() => false);
   if (!up) return tt.skip("local gateway is not running");
   const t = await boot(realFactory, { home: tempHome() });
-  const bot = (await t.api("POST", "/api/bots", { name: "Gw", role: "", agent: "codex", model: "gpt-6-luna", effort: "low", route: "gateway", cwd: mkdtempSync(join(tmpdir(), "bot-gw-")) })).body;
+  const bot = (await t.api("POST", "/api/bots", { name: "Gw", role: "", agent: "codex", model: CHEAPEST.codex, effort: "low", route: "gateway", cwd: mkdtempSync(join(tmpdir(), "bot-gw-")) })).body;
   const r = await run(t, bot.id, "回复两个字：收到", () => "deny");
   assert.deepEqual(errors(r.d), []);
   assert.ok(r.d.items.some((i: any) => i.type === "assistant" && i.data.text));

@@ -7,10 +7,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { boot } from "../helpers.ts";
 import { realFactory } from "../../src/daemon/factory.ts";
+import { CHEAPEST } from "./cheap.ts";
 
 const CASES = [
-  { agent: "claude", model: "claude-sonnet-5-5" },
-  { agent: "codex", model: "gpt-6-luna" },
+  { agent: "claude", model: CHEAPEST.claude },
+  { agent: "codex", model: CHEAPEST.codex },
 ];
 
 for (const c of CASES) {

@@ -1,10 +1,10 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { agentEnv } from "./adapters/process.ts";
 import { HttpError } from "./errors.ts";
-import { git } from "./git.ts";
+import { diffWithNewFiles, git } from "./git.ts";
 import type { Store } from "./store.ts";
 
 const SCHEMA = `
@@ -314,14 +314,9 @@ export class Research {
     } catch (e) {
       writeFileSync(join(dir, "code.json"), JSON.stringify({ commit, dirty: true, complete: false, error: (e as Error).message }, null, 2));
       return { commit, dirty: true, hash: null, complete: false };
-    } finally {
-      rmSync(join(dir, ".snapshot-index"), { force: true });
-      rmSync(join(dir, ".snapshot-paths"), { force: true });
     }
   }
 
-  // `git diff HEAD` skips files Git has not seen yet, and a new training script is exactly that. A throwaway index
-  // marks them as intended additions, so the patch carries them while the user's index and object store stay untouched.
   private async snapshot(cwd: string, dir: string, commit: string, testDir: string) {
     const top = (await git(cwd, ["rev-parse", "--show-toplevel"])).trim();
     const hidden = testDir && existsSync(testDir) ? realpathSync(testDir) : testDir;
@@ -337,18 +332,7 @@ export class Research {
       else files.push({ path, size: st.size, sha256: null, included: false }); // A nested repository.
       if (!files.at(-1)!.included) complete = false;
     }
-    const index = join(dir, ".snapshot-index");
-    const current = resolve(top, (await git(top, ["rev-parse", "--git-path", "index"])).trim());
-    if (existsSync(current)) copyFileSync(current, index);
-    const env = { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: "1" };
-    const adding = files.filter((f) => f.included).map((f) => f.path);
-    if (adding.length) {
-      const paths = join(dir, ".snapshot-paths");
-      writeFileSync(paths, adding.join("\0"));
-      await git(top, ["add", "--intent-to-add", `--pathspec-from-file=${paths}`, "--pathspec-file-nul"], env);
-    }
-    // Fixed options, so a user's diff settings cannot change the patch or its hash.
-    const diff = await git(top, ["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", "HEAD"], env);
+    const diff = await diffWithNewFiles(top, "HEAD", files.filter((f) => f.included).map((f) => f.path), ["--binary"]);
     const left = files.filter((f) => !f.included);
     const hash = sha256(JSON.stringify([commit, sha256(diff), left]));
     if (diff.length > SNAPSHOT_MAX_DIFF) complete = false;

@@ -1,9 +1,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, extname } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { BUS_TOOLS, CHIEF_TOOLS, MODELS, RESEARCH_TOOLS, type AgentEvent, type AgentKind, type AgentRuntime, type ApprovalDecision, type Bot, type Conversation, type Group, type Item, type RuntimeFactory, type TurnStatus } from "./types.ts";
 import { HttpError } from "./errors.ts";
-import { Memory, Worktrees, type MemoryScope, type Worktree, changedSince, git, workState, type WorkState } from "./git.ts";
+import { Memory, Worktrees, type MemoryScope, type Worktree, changedSince, git, workState, type WorkState, diffWithNewFiles } from "./git.ts";
 import { Research } from "./research.ts";
 import type { Store } from "./store.ts";
 
@@ -22,6 +23,9 @@ const ACTIVITY_MS = 300;
 const BASELINE_WAIT_MS = 2000;
 const MAX_RESULT_FILES = 100;
 const MAX_RESULT_DIFF = 400_000;
+// A new file above this is listed by size and type: a reader wants to check code, not scroll a data file.
+const MAX_PREVIEW_FILE = 1024 * 1024;
+const CANCEL_NOTE = "你取消了这个任务";
 // What a person would accept as "it was checked". A match says only that the command ran and how it exited.
 const CHECK_COMMAND = /(^|[\s;&|/])(pytest|tox|ctest|vitest|jest|mypy|ruff|eslint|tsc|unittest|(npm|pnpm|yarn)( run)? (test|lint|check)\S*|node --test|cargo (test|check|clippy)|go (test|vet)|(mvn|gradle) test|make (test|check))(\s|$)/;
 const PROPOSAL_FIELDS = ["name", "role", "agent", "model", "effort", "permission", "budget_tokens"];
@@ -85,6 +89,7 @@ interface TaskRun extends CallRun {
   dependsOn: string[];
   timeoutMs: number;
   timedOut: boolean;
+  cancelled: boolean;
   clock: NodeJS.Timeout | null;
   forceTimer: NodeJS.Timeout | null;
   force: (r: TurnResult) => void;
@@ -182,6 +187,8 @@ export class Engine {
   private readonly busTokens = new Map<string, Live>();
   private readonly approvalOwners = new Map<string, Live>();
   private readonly roots = new Map<string, RootTurn>();
+  // Sessions promised to a call. Taken before anything awaits, because an agent still starting has no turn to look at yet.
+  private readonly sessionsInUse = new Set<string>();
   private readonly reaper: NodeJS.Timeout;
 
   constructor(o: { store: Store; factory: RuntimeFactory; broadcast: Broadcast; idleMs?: number; busUrl: () => string; validateBot: (input: any, existing?: Bot) => Promise<any>; pollMs?: number; sshPollMs?: number }) {
@@ -334,7 +341,9 @@ export class Engine {
     const made = this.store.listWorktrees(root.convId).filter((w) => w.status === "active" && Number((w as any).created_at) >= root.startedAt);
     if (!files.length && !made.length && !root.checks.length) return;
     const worktrees = await Promise.all(made.map(async (w) => ({ id: w.id, branch: w.branch, bot: w.bot_name, changes: clip(await this.worktrees.changes(w), 1000) })));
-    this.addItem(root.convId, null, "result", status, {
+    // A diff too big to read costs the preview, not the card.
+    const snapshot = gitFiles.length ? await this.saveDiff(before!, gitFiles.slice(0, MAX_RESULT_FILES), gitFiles.length, this.store.getConversation(root.convId)!.cwd).catch(() => null) : null;
+    const item = this.addItem(root.convId, null, "result", status, {
       summary: clip(root.lastText.trim(), 300),
       source: gitFiles.length ? "git" : files.length ? "agent" : "none",
       files: files.slice(0, MAX_RESULT_FILES),
@@ -342,10 +351,40 @@ export class Engine {
       commits: changes?.commits ?? 0,
       worktrees,
       checks: root.checks,
-      // A folder with no commits yet has nothing to compare against.
-      repo: gitFiles.length && before?.head ? { top: before.top, base: before.head } : null,
+      repo: snapshot ? { top: before!.top, base: snapshot.base } : null,
       accepted: false,
     });
+    if (snapshot) {
+      mkdirSync(this.resultsDir, { recursive: true });
+      writeFileSync(join(this.resultsDir, `${item.id}.json`), JSON.stringify(snapshot));
+    }
+  }
+
+  private get resultsDir() {
+    return join(this.store.home, "results");
+  }
+
+  // Saved when the round ends. Read later, it would show whatever the directory has become by then.
+  private async saveDiff(before: WorkState, files: { path: string }[], total: number, convCwd: string) {
+    const base = before.head ?? (await git(before.top, ["hash-object", "-t", "tree", "/dev/null"])).trim();
+    const testDir = this.research.settings(Memory.projectId(convCwd)).test_dir;
+    const hidden = testDir && existsSync(testDir) ? realpathSync(testDir) : testDir;
+    const paths = files.map((f) => f.path).filter((p) => {
+      const full = join(before.top, p);
+      return !hidden || (full !== hidden && !full.startsWith(`${hidden}/`));
+    });
+    if (!paths.length) return { base, diff: "", clipped: false, skipped: [], clippedFiles: total !== files.length };
+    const listed = (await git(before.top, ["ls-files", "-o", "--exclude-standard", "-z", "--", ...paths], { GIT_LITERAL_PATHSPECS: "1" })).split("\0").filter(Boolean);
+    const skipped: { path: string; size: number; type: string }[] = [];
+    const newFiles: string[] = [];
+    for (const path of listed) {
+      const size = lstatSync(join(before.top, path)).size;
+      if (size > MAX_PREVIEW_FILE) skipped.push({ path, size, type: extname(path) || "无扩展名" });
+      else newFiles.push(path);
+    }
+    const shown = paths.filter((p) => !skipped.some((f) => f.path === p));
+    const diff = shown.length ? await diffWithNewFiles(before.top, base, newFiles, [], shown) : "";
+    return { base, diff: diff.slice(0, MAX_RESULT_DIFF), clipped: diff.length > MAX_RESULT_DIFF, skipped, clippedFiles: total !== files.length };
   }
 
   acceptResult(itemId: string) {
@@ -354,17 +393,20 @@ export class Engine {
     return this.updateItem(itemId, { data: { ...item.data, accepted: true } });
   }
 
+  // Neither of these says the work was good: only accepting does.
+  reviewResult(itemId: string, state: unknown) {
+    const item = this.store.getItem(itemId);
+    if (!item || item.type !== "result") throw new HttpError(404, "没有这个结果");
+    if (state !== "later" && state !== "dismissed") throw new HttpError(400, "状态无效");
+    return this.updateItem(itemId, { data: { ...item.data, review: state } });
+  }
+
   async resultDiff(itemId: string) {
     const item = this.store.getItem(itemId);
-    const repo = item?.type === "result" ? (item.data.repo as { top: string; base: string } | null) : null;
-    if (!repo) throw new HttpError(404, "这个结果没有可比较的 Git 记录");
-    const files = (item!.data.files as { path: string; change: string }[]).map((f) => f.path);
-    const env = { GIT_LITERAL_PATHSPECS: "1" };
-    const diff = await git(repo.top, ["diff", "--no-color", "--no-ext-diff", repo.base, "--", ...files], env).catch((e) => {
-      throw new HttpError(409, `读不到改动：${e.message}`);
-    });
-    const untracked = (await git(repo.top, ["ls-files", "-o", "--exclude-standard", "--", ...files], env).catch(() => "")).split("\n").filter(Boolean);
-    return { base: repo.base.slice(0, 8), diff: diff.slice(0, MAX_RESULT_DIFF), clipped: diff.length > MAX_RESULT_DIFF, untracked, clippedFiles: item!.data.total !== files.length };
+    if (item?.type !== "result" || !item.data.repo) throw new HttpError(404, "这个结果没有可比较的 Git 记录");
+    const file = join(this.resultsDir, `${item.id}.json`);
+    if (!existsSync(file)) throw new HttpError(404, "这张卡片没有保存当时的改动（可能是旧版本生成的，或者改动太大）");
+    return JSON.parse(readFileSync(file, "utf8")) as { base: string; diff: string; clipped: boolean; skipped: { path: string; size: number; type: string }[]; clippedFiles: boolean };
   }
 
   // ---------- recovering from a failure ----------
@@ -470,10 +512,11 @@ export class Engine {
   listInbox() {
     return this.store.listInbox(INBOX_LIMIT).map((r) => {
       const d = JSON.parse(r.data as string);
-      const base = { id: r.id, conv_id: r.conv_id, conv_title: r.conv_title, bot_id: r.bot_id, group_id: r.group_id, at: r.created_at };
+      const superseded = r.type === "result" && r.seq !== r.latest_result;
+      const base = { id: r.id, conv_id: r.conv_id, conv_title: r.conv_title, bot_id: r.bot_id, group_id: r.group_id, at: r.created_at, superseded };
       if (r.type === "approval") return { ...base, kind: "approval", title: d.from ? `${d.from}：${d.title}` : d.title };
       if (r.type === "queued") return { ...base, kind: "unsent", title: clip(String(d.text), 120), detail: d.reason ?? null };
-      return { ...base, kind: "result", title: clip(String(d.summary || (d.total ? `改动了 ${d.total} 个文件` : "这一轮有结果要确认")), 120) };
+      return { ...base, kind: d.review === "later" ? "later" : "result", title: clip(String(d.summary || (d.total ? `改动了 ${d.total} 个文件` : "这一轮有结果要确认")), 120), detail: superseded ? "后面已有更新的结果" : null };
     });
   }
 
@@ -966,7 +1009,7 @@ export class Engine {
         if ("refused" in prepared) return { text: `REFUSED：${prepared.refused}`, isError: true };
         const call: CallRun = { callId: prepared.callId, itemId: prepared.itemId, callerName: l.bot.name, ctx, target: prepared.target, child: prepared.child, question: String(body), worktree: prepared.worktree };
         if (!async) return this.runCall(call);
-        this.launchTask(call, dependsOn, timeoutMs);
+        this.launchTask(call, dependsOn, timeoutMs, prepared.queued);
         return { text: JSON.stringify({ task_id: prepared.callId, status: this.store.getCall(prepared.callId)!.status }), isError: false };
       }
       case "get_task": {
@@ -1142,7 +1185,7 @@ export class Engine {
     return ceiling ? Math.min(askedMs, ceiling) : askedMs;
   }
 
-  private async prepareCall(l: Live, ctx: TurnCtx, name: unknown, body: unknown, mode: string, place: { isolated: boolean; workspace?: string; dependsOn: string[]; timeoutMs: number }): Promise<{ refused: string } | { callId: string; itemId: string; target: Bot; child: Conversation; worktree: Worktree | null }> {
+  private async prepareCall(l: Live, ctx: TurnCtx, name: unknown, body: unknown, mode: string, place: { isolated: boolean; workspace?: string; dependsOn: string[]; timeoutMs: number }): Promise<{ refused: string } | { callId: string; itemId: string; target: Bot; child: Conversation; worktree: Worktree | null; queued: boolean }> {
     const root = ctx.root;
     const refuse = (reason: string, to = String(name ?? "?")) => {
       const id = randomUUID();
@@ -1169,12 +1212,14 @@ export class Engine {
     }
     let child = place.isolated ? undefined : this.store.findChild("call", l.convId, target.id, cwd);
     if (child && child.agent !== target.agent) child = undefined;
-    // A deferred task starts once that Bot is free, so being busy now is not a reason to refuse it.
-    if (child && !deferred && this.live.get(child.id)?.turnId) return refuse(`${target.name} 正在处理你上一个请求，请先等待结果`, target.name);
+    // A question has someone waiting on the answer, so it is told to wait. A task can queue for that Bot.
+    const busy = Boolean(child && this.childBusy(child.id));
+    if (busy && mode !== "task") return refuse(`${target.name} 正在处理你上一个请求，请先等待结果`, target.name);
+    const queued = deferred || busy;
 
     // Counted before the first await, so parallel calls cannot slip past the limits.
     root.callCount++;
-    if (!deferred) root.activeCalls++;
+    if (!queued) root.activeCalls++;
     let worktree: Worktree | null = null;
     if (place.isolated) {
       try {
@@ -1184,17 +1229,18 @@ export class Engine {
         this.broadcast({ type: "worktrees", convId: root.convId });
       } catch (e) {
         root.callCount--;
-        if (!deferred) root.activeCalls--;
+        if (!queued) root.activeCalls--;
         return refuse((e as Error).message, target.name);
       }
     }
     child ??= this.store.createChild("call", l.convId, target, cwd, `${l.bot.name} → ${target.name}`);
+    if (!queued) this.sessionsInUse.add(child.id);
     const callId = randomUUID();
-    const status = deferred ? "waiting" : "running";
+    const status = queued ? "waiting" : "running";
     this.store.addCall({ id: callId, rootTurnId: root.id, rootConvId: root.convId, callerConvId: l.convId, childConvId: child.id, parentCallId: ctx.callId, from: l.bot.name, to: target.name, mode, depth: ctx.depth + 1, question: body, status, chain: ctx.chain, dependsOn: place.dependsOn, timeoutMs: place.timeoutMs });
     const item = this.addItem(ctx.displayConvId, l.turnId, "call", status, { from: l.bot.name, to: target.name, toId: target.id, question: body, childConvId: child.id, mode, callId, branch: worktree?.branch });
     this.broadcast({ type: "trace", convId: root.convId });
-    return { callId, itemId: item.id, target, child, worktree };
+    return { callId, itemId: item.id, target, child, worktree, queued };
   }
 
   private async runCall(c: CallRun): Promise<CallResult> {
@@ -1204,6 +1250,7 @@ export class Engine {
     const prompt = `这是来自同事 Bot ${c.callerName} 的请求（调用链：${chainNames}）。请完成它，并在最后一条回复里直接给出结论，对方只能看到这条回复。${worktree ? `\n\n你在独立的 Git 工作树里工作（分支 ${worktree.branch}），改动不会影响别人。不用提交，用户验收后平台会统一提交。` : ""}${c.retryNote ? `\n\n${c.retryNote}` : ""}${deps.join("")}\n\n${c.question}`;
     const turn = this.runTurn(target, child.id, prompt, { root: ctx.root, displayConvId: child.id, depth: ctx.depth + 1, chain: [...ctx.chain, target.id], callId, callPath: [...ctx.callPath, callId], speaker: null });
     const r = await (task ? Promise.race([turn, task.forced]) : turn);
+    this.sessionsInUse.delete(child.id);
     ctx.root.activeCalls--;
     const answer = r.text.length > MAX_ANSWER ? `${r.text.slice(0, MAX_ANSWER)}\n…（回答过长，已截断）` : r.text;
     const completed = r.status === "completed";
@@ -1222,22 +1269,24 @@ export class Engine {
   // The most specific thing we know, because this is what a person reads to decide whether to retry.
   private stopReason(c: CallRun, r: TurnResult) {
     const { root } = c.ctx;
+    if (c.task?.cancelled) return CANCEL_NOTE;
     if (c.task?.timedOut) return `超过 ${duration(c.task.timeoutMs)}没有完成，已停止`;
     if (r.status === "failed") return r.error || "调用失败";
+    if (c.ctx.callPath.some((id) => root.tasks.get(id)?.cancelled)) return "它所属的任务被取消了，一起停止";
     if (c.ctx.callPath.some((id) => root.tasks.get(id)?.timedOut)) return "它所属的任务超时了，一起停止";
     return root.stopNote ?? "调用被中断";
   }
 
   // ---------- tasks ----------
-  private launchTask(call: CallRun, dependsOn: string[], timeoutMs: number) {
+  private launchTask(call: CallRun, dependsOn: string[], timeoutMs: number, queued = false) {
     let settle!: TaskRun["settle"];
     let force!: TaskRun["force"];
     const done = new Promise<CallResult>((r) => (settle = r));
     const forced = new Promise<TurnResult>((r) => (force = r));
-    const task: TaskRun = { ...call, state: "waiting", dependsOn, timeoutMs, timedOut: false, clock: null, forceTimer: null, force, forced, settle, done };
+    const task: TaskRun = { ...call, state: "waiting", dependsOn, timeoutMs, timedOut: false, cancelled: false, clock: null, forceTimer: null, force, forced, settle, done };
     task.task = task;
     call.ctx.root.tasks.set(call.callId, task);
-    if (dependsOn.length) this.pumpTasks(call.ctx.root);
+    if (dependsOn.length || queued) this.pumpTasks(call.ctx.root);
     else this.startTask(task);
     return task;
   }
@@ -1273,8 +1322,9 @@ export class Engine {
         ended = true;
         continue;
       }
-      if (deps.some((d) => d.status !== "done") || root.activeCalls >= maxActive || this.childBusy(t.child.id, root)) continue;
+      if (deps.some((d) => d.status !== "done") || root.activeCalls >= maxActive || this.childBusy(t.child.id)) continue;
       root.activeCalls++;
+      this.sessionsInUse.add(t.child.id);
       this.store.startCall(t.callId);
       const cur = this.store.getItem(t.itemId);
       if (cur) this.updateItem(t.itemId, { status: "running" });
@@ -1285,8 +1335,8 @@ export class Engine {
     if (ended) this.pumpTasks(root);
   }
 
-  private childBusy(childId: string, root: RootTurn) {
-    return Boolean(this.live.get(childId)?.turnId) || [...root.tasks.values()].some((t) => t.state === "running" && t.child.id === childId);
+  private childBusy(childId: string) {
+    return this.sessionsInUse.has(childId) || Boolean(this.live.get(childId)?.turnId);
   }
 
   private endWaiting(t: TaskRun, status: string, reason: string) {
@@ -1321,11 +1371,15 @@ export class Engine {
 
   // Stops this task and what it started, and nothing else in the round.
   private timeOutTask(task: TaskRun) {
-    const { root } = task.ctx;
     task.timedOut = true;
+    this.haltTask(task, "它所属的任务超时了，一起停止");
+  }
+
+  private haltTask(task: TaskRun, note: string) {
+    const { root } = task.ctx;
     for (const l of this.inSubtree(task)) void this.interruptLive(l);
     for (const t of root.tasks.values()) {
-      if (t.state === "waiting" && t.ctx.callPath.includes(task.callId)) this.endWaiting(t, "interrupted", "它所属的任务超时了，一起停止");
+      if (t.state === "waiting" && t.ctx.callPath.includes(task.callId)) this.endWaiting(t, "interrupted", note);
     }
     // An agent stuck before its turn began has nothing to interrupt, and the task must still end.
     task.forceTimer = setTimeout(() => {
@@ -1333,6 +1387,54 @@ export class Engine {
       task.force({ status: "interrupted", text: "", tokens: 0 });
     }, INTERRUPT_GRACE_MS + 1000);
     task.forceTimer.unref();
+  }
+
+  cancelTask(id: string) {
+    const row = this.store.getCall(id);
+    if (!row || row.mode !== "task") throw new HttpError(404, "任务不存在");
+    const root = this.roots.get(row.root_conv_id as string);
+    const task = root?.tasks.get(id);
+    if (!root || !task || task.state === "finished") throw new HttpError(409, "这个任务已经结束了");
+    if (task.state === "waiting") {
+      this.endWaiting(task, "interrupted", CANCEL_NOTE);
+      this.pumpTasks(root);
+    } else {
+      task.cancelled = true;
+      if (task.clock) clearInterval(task.clock);
+      task.clock = null;
+      this.haltTask(task, "它所属的任务被取消了，一起停止");
+    }
+    return this.taskView(this.store.getCall(id)!);
+  }
+
+  // What else stops with this task, so a person can see it before deciding.
+  private taskAffects(r: Record<string, unknown>) {
+    const going = this.store.listCalls(r.root_turn_id as string).filter((c) => STILL_GOING.includes(c.status as string));
+    const out: { owner: unknown; title: string; why: string }[] = [];
+    const seen = new Set<unknown>([r.id]);
+    const walk = (id: unknown) => {
+      for (const c of going) {
+        if (seen.has(c.id)) continue;
+        const deps = c.depends_on ? (JSON.parse(c.depends_on as string) as string[]) : [];
+        const dependent = deps.some((d) => this.store.latestAttempt(d)?.id === id);
+        if (c.parent_call_id !== id && !dependent) continue;
+        seen.add(c.id);
+        out.push({ owner: c.to_bot, title: firstLine(c.question), why: dependent ? "依赖它的任务" : c.mode === "task" ? "它派的任务" : "它发起的提问" });
+        walk(c.id);
+      }
+    };
+    walk(r.id);
+    return out;
+  }
+
+  // Said before the click, because a retry can start a new round and does not undo what the last attempt left behind.
+  private retryInfo(r: Record<string, unknown>) {
+    const conv = this.store.getConversation(r.root_conv_id as string);
+    const child = r.child_conv_id ? this.store.getConversation(r.child_conv_id as string) : undefined;
+    if (!conv || !child) return null;
+    const worktree = this.store.listWorktrees(conv.id).find((w) => child.cwd === w.path || child.cwd.startsWith(`${w.path}/`));
+    const budget = conv.kind === "group" ? this.store.getGroup(conv.group_id!)?.budget_tokens : conv.bot_id ? this.store.getBot(conv.bot_id)?.budget_tokens : undefined;
+    return { cwd: child.cwd, worktree: worktree?.branch ?? null, keeps_changes: true, new_round: !this.roots.has(conv.id), budget: budget ?? null, resumes_session: Boolean(child.session_id) };
   }
 
   // Only a person can retry, and it goes through the same checks a Bot's call does. Nothing here
@@ -1363,7 +1465,7 @@ export class Engine {
     const at = { chain, depth: (row.depth as number) - 1 };
     const refusal = this.callRefusal(caller, target, at, open ?? { stopping: false, overBudget: false, callCount: 0, activeCalls: 0 }, deferred);
     if (refusal) throw new HttpError(409, refusal);
-    if (open && !deferred && this.childBusy(oldChild.id, open)) throw new HttpError(409, `${target.name} 正在忙，请等它结束再重试`);
+    if (open && !deferred && this.childBusy(oldChild.id)) throw new HttpError(409, `${target.name} 正在忙，请等它结束再重试`);
     const worktree = this.store.listWorktrees(conv.id).find((w) => oldChild.cwd === w.path || oldChild.cwd.startsWith(`${w.path}/`)) ?? null;
     if (worktree && worktree.status !== "active") throw new HttpError(409, "这个任务的工作树已经合并或丢弃，不能在上面重试");
 
@@ -1373,6 +1475,7 @@ export class Engine {
     root.callCount++;
     if (!deferred) root.activeCalls++;
     const child = oldChild.agent === target.agent ? oldChild : this.store.createChild("call", callerConv.id, target, oldChild.cwd, `${caller.name} → ${target.name}`);
+    if (!deferred) this.sessionsInUse.add(child.id);
     const callId = randomUUID();
     const status = deferred ? "waiting" : "running";
     const timeoutMs = this.taskTimeout(Number(row.timeout_ms));
@@ -1388,7 +1491,7 @@ export class Engine {
       void task.done.then((r) => {
         const after = this.store.getCall(callId)!;
         // This task is all the round there was.
-        if (after.status !== "done") root.failed = true;
+        if (after.status === "failed" || after.status === "timeout") root.failed = true;
         this.addItem(conv.id, null, "notice", "done", { text: `重试的任务（${after.from_bot} → ${after.to_bot}，task_id ${callId}）${OUTCOME[after.status as string] ?? after.status}：${clip(r.text, NOTICE_ANSWER)}` });
         this.closeRoot(root);
       });
@@ -1412,6 +1515,9 @@ export class Engine {
     const ids = r.depends_on ? (JSON.parse(r.depends_on as string) as string[]) : [];
     const deps = ids.map((id) => this.store.latestAttempt(id)).filter((d) => d !== undefined);
     const failing = RETRYABLE.includes(r.status as string) || r.status === "refused";
+    const canRetry = RETRYABLE.includes(r.status as string) && Boolean(r.chain) && this.store.latestAttempt(r.id as string)!.id === r.id;
+    const run = this.roots.get(r.root_conv_id as string)?.tasks.get(r.id as string);
+    const canCancel = Boolean(run && run.state !== "finished");
     return {
       id: r.id,
       conv_id: r.root_conv_id,
@@ -1430,7 +1536,10 @@ export class Engine {
       tokens: r.tokens,
       timeout_ms: r.timeout_ms,
       attempt: this.store.attemptNumber(r.id as string),
-      can_retry: RETRYABLE.includes(r.status as string) && Boolean(r.chain) && this.store.latestAttempt(r.id as string)!.id === r.id,
+      can_retry: canRetry,
+      retry_info: canRetry ? this.retryInfo(r) : null,
+      can_cancel: canCancel,
+      affects: canCancel ? this.taskAffects(r) : [],
       created_at: r.created_at,
       ended_at: r.ended_at,
     };

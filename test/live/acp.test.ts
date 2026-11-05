@@ -6,10 +6,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { boot, tempHome } from "../helpers.ts";
 import { realFactory } from "../../src/daemon/factory.ts";
+import { CHEAPEST } from "./cheap.ts";
 
 const CASES = [
-  { agent: "grok", model: "grok-4.7-build-fast" },
-  { agent: "antigravity", model: "gemini-3.8-flash" },
+  { agent: "grok", model: CHEAPEST.grok },
+  { agent: "antigravity", model: CHEAPEST.antigravity },
 ];
 
 async function turn(t: any, botId: string, text: string, conversationId?: string) {

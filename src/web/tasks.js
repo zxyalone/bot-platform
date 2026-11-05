@@ -36,6 +36,23 @@ export function mountTasks(root, ctx) {
     await refresh();
   }
 
+  async function cancel(t) {
+    const also = t.affects.map((a) => `- ${a.owner}：${a.title}（${a.why}）`).join("\n");
+    if (!confirm(`取消 ${t.owner} 的这个任务？${also ? `\n\n会一起停止：\n${also}` : ""}\n\n已经做的改动不会还原。`)) return;
+    ui.busy.add(t.id);
+    draw();
+    try {
+      await api(`/api/tasks/${t.id}/cancel`, { method: "POST", body: {} });
+      ui.retryError = null;
+    } catch (e) {
+      ui.retryError = `${t.owner} 的任务不能取消：${e.message}`;
+    }
+    ui.busy.delete(t.id);
+    await refresh();
+  }
+
+  const retryText = (i) => [`在 ${i.cwd}${i.worktree ? `（工作树 ${i.worktree}）` : ""} 继续，上次留下的改动不会还原`, i.resumes_session ? "接着对方原来的 agent 会话" : "对方从新会话开始", i.new_round ? `这一轮已结束，会新开一轮，最多再用 ${i.budget ?? "每轮预算的"} tokens` : "计入还在进行的这一轮的预算和调用次数"].join("；");
+
   function card(t) {
     const line = (label, text, cls = "") => h("div", { class: "task-line" }, h("span", { class: "task-label" }, label), h("span", { class: cls }, text));
     return h(
@@ -46,6 +63,8 @@ export function mountTasks(root, ctx) {
       t.depends_on.length ? h("div", { class: "task-line" }, h("span", { class: "task-label" }, "依赖"), h("span", {}, t.depends_on.map((d) => h("span", { class: "task-dep" }, `${d.owner}：${d.title}`, h("span", { class: `tag state-${d.status}` }, TASK_STATUS[d.status] ?? d.status))))) : null,
       t.waiting_reason ? line("在等", t.waiting_reason, "task-waiting") : null,
       t.failure_reason ? line("原因", t.failure_reason, "task-failure") : null,
+      t.affects.length ? line("取消影响", `会一起停止 ${t.affects.map((a) => `${a.owner}（${a.why}）`).join("、")}`) : null,
+      t.retry_info ? line("重试时", retryText(t.retry_info)) : null,
       t.answer ? h("details", { class: "task-answer", open: ui.expanded.has(t.id), ontoggle: (e) => (e.target.open ? ui.expanded.add(t.id) : ui.expanded.delete(t.id)) }, h("summary", {}, "结论"), h("p", {}, t.answer)) : null,
       h(
         "div",
@@ -53,6 +72,7 @@ export function mountTasks(root, ctx) {
         h("button", { type: "button", class: "link-btn", onclick: () => onOpen(t) }, t.conv_title),
         h("span", { class: "spacer" }),
         t.tokens ? h("span", { class: "muted small" }, `${t.tokens} tokens`) : null,
+        t.can_cancel ? h("button", { type: "button", class: "danger", disabled: ui.busy.has(t.id) ? true : null, onclick: () => cancel(t) }, "取消") : null,
         t.can_retry ? h("button", { type: "button", disabled: ui.busy.has(t.id) ? true : null, title: "如果这一轮已经结束，会新开一轮，占用一份每轮预算；调用次数、深度、并发和审批照常生效", onclick: () => retry(t) }, "重试") : null,
       ),
     );

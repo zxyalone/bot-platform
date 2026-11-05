@@ -6,15 +6,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { boot, tempHome } from "../helpers.ts";
 import { realFactory } from "../../src/daemon/factory.ts";
+import { CHEAPEST } from "./cheap.ts";
 
 test("a real chain across vendors returns the right answer and is traced", { timeout: 300000 }, async () => {
   const t = await boot(realFactory, { home: tempHome() });
   const cwd = mkdtempSync(join(tmpdir(), "bot-chain-"));
   const mk = async (name: string, agent: string, model: string, role: string, can_call: string[] | null) =>
     (await t.api("POST", "/api/bots", { name, role, agent, model, effort: "low", cwd, budget_tokens: 120000, can_call })).body;
-  const leaf = await mk("Leaf", "claude", "claude-sonnet-5-5", "你负责算术，只回答数字。", []);
-  const mid = await mk("Mid", "codex", "gpt-6-luna", "你负责转交算术题，用 ask_bot 问 Leaf，再把结果告诉对方。", [leaf.id]);
-  const top = await mk("Top", "claude", "claude-sonnet-5-5", "你负责协调。", [mid.id]);
+  const leaf = await mk("Leaf", "claude", CHEAPEST.claude, "你负责算术，只回答数字。", []);
+  const mid = await mk("Mid", "codex", CHEAPEST.codex, "你负责转交算术题，用 ask_bot 问 Leaf，再把结果告诉对方。", [leaf.id]);
+  const top = await mk("Top", "claude", CHEAPEST.claude, "你负责协调。", [mid.id]);
   const [a, b] = [100 + Math.floor(Math.random() * 900), 100 + Math.floor(Math.random() * 900)];
 
   const conv = (await t.api("POST", `/api/bots/${top.id}/messages`, { text: `请用 ask_bot 问 Mid：${a} 乘以 ${b} 等于多少？（Mid 会去问 Leaf。）只把最终数字告诉我。` })).body.id;

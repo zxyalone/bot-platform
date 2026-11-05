@@ -276,7 +276,7 @@ test("the card reports what Git saw, not what was already dirty, and not what th
   const d = (await s.t.api("GET", `/api/items/${c.id}/diff`)).body;
   assert.match(d.diff, /a\.py/);
   assert.doesNotMatch(d.diff, /dirty\.py/);
-  assert.deepEqual(d.untracked, ["new file.py"]);
+  assert.match(d.diff, /new file\.py/);
   s.t.close();
 });
 

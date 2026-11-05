@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { boot, tempHome } from "../helpers.ts";
 import { realFactory } from "../../src/daemon/factory.ts";
 import { CHIEF_ROLE } from "../../src/daemon/store.ts";
+import { CHEAPEST } from "./cheap.ts";
 
 const idle = (t: any, id: string, ms = 240000) =>
   t.waitFor(async () => {
@@ -26,8 +27,8 @@ test("a one-line request goes through Chief into a worktree and can be merged", 
   git("commit", "-q", "-m", "init");
 
   const t = await boot(realFactory, { home: tempHome() });
-  const chief = t.store.createBot({ name: "Chief", role: CHIEF_ROLE, agent: "claude", model: "claude-sonnet-5-5", effort: "low", permission: "read_only", route: "official", budget_tokens: 120000, is_chief: 1, cwd: repo });
-  await t.api("POST", "/api/bots", { name: "Eng", role: "你是工程师，按要求改文件，做完用一句话说明。", agent: "codex", model: "gpt-6-luna", effort: "low", permission: "auto_edit", can_call: [] });
+  const chief = t.store.createBot({ name: "Chief", role: CHIEF_ROLE, agent: "claude", model: CHEAPEST.claude, effort: "low", permission: "read_only", route: "official", budget_tokens: 120000, is_chief: 1, cwd: repo });
+  await t.api("POST", "/api/bots", { name: "Eng", role: "你是工程师，按要求改文件，做完用一句话说明。", agent: "codex", model: CHEAPEST.codex, effort: "low", permission: "auto_edit", can_call: [] });
 
   const conv = (await t.api("POST", `/api/bots/${chief.id}/messages`, { text: "在仓库里新建 hello.txt，内容是 hello。" })).body.id;
   const d: any = await idle(t, conv);
@@ -44,7 +45,7 @@ test("a one-line request goes through Chief into a worktree and can be merged", 
   t.close();
 });
 
-for (const [agent, model] of [["claude", "claude-sonnet-5-5"], ["codex", "gpt-6-luna"]]) {
+for (const [agent, model] of [["claude", CHEAPEST.claude], ["codex", CHEAPEST.codex]]) {
   test(`${agent}: read-only cannot write, and asks nobody`, { timeout: 200000 }, async () => {
     const t = await boot(realFactory, { home: tempHome() });
     const cwd = mkdtempSync(join(tmpdir(), `bot-ro-${agent}-`));

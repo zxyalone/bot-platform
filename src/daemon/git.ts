@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, relative, resolve } from "node:path";
 import { agentEnv } from "./adapters/process.ts";
 import { HttpError } from "./errors.ts";
 import type { Store } from "./store.ts";
@@ -13,6 +14,27 @@ export function git(cwd: string, args: string[], env: Record<string, string> = {
       else resolve(stdout);
     });
   });
+}
+
+// `git diff` skips files Git has not seen yet, and a new file is often the whole point. A throwaway index
+// marks them as intended additions, so the patch carries them while the user's index and object store stay untouched.
+export async function diffWithNewFiles(top: string, base: string, newFiles: string[], args: string[], only?: string[]) {
+  const dir = mkdtempSync(join(tmpdir(), "bot-index-"));
+  try {
+    const index = join(dir, "index");
+    const current = resolve(top, (await git(top, ["rev-parse", "--git-path", "index"])).trim());
+    if (existsSync(current)) copyFileSync(current, index);
+    const env = { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: "1" };
+    if (newFiles.length) {
+      const paths = join(dir, "paths");
+      writeFileSync(paths, newFiles.join("\0"));
+      await git(top, ["add", "--intent-to-add", `--pathspec-from-file=${paths}`, "--pathspec-file-nul"], env);
+    }
+    // Fixed options, so a user's diff settings cannot change the patch.
+    return await git(top, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", ...args, base, ...(only ? ["--", ...only] : [])], env);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // What a directory looks like now, so a round can report what actually changed instead of what a model says changed.

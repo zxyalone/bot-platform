@@ -104,7 +104,7 @@ export interface AgentRuntime {
 export type RuntimeFactory = (options: RuntimeOptions) => AgentRuntime;
 
 export const MODELS: Record<AgentKind, string[]> = {
-  claude: ["claude-opus-5-5", "claude-sonnet-5-5"],
+  claude: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
   codex: ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"],
   grok: ["grok-4.7", "grok-4.7-build-fast", "grok-4.6"],
   antigravity: ["gemini-4-argon", "gemini-3.8-flash"],
