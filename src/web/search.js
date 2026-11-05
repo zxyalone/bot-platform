@@ -4,7 +4,7 @@ import { icon } from "./icons.js";
 const KINDS = [["", "全部"], ["message", "聊天"], ["task", "任务"], ["file", "结果和文件"], ["experiment", "实验"]];
 const STATUSES = [["", "任意状态"], ["running", "进行中"], ["done", "完成"], ["failed", "失败"], ["stopped", "已停止"]];
 const TIMES = [["", "全部时间"], ["1", "今天"], ["7", "最近 7 天"], ["30", "最近 30 天"]];
-const KIND_LABEL = { user: "你的消息", assistant: "回复", notice: "通知", error: "错误", call: "调用", result: "结果", experiment: "实验", idea: "想法" };
+const KIND_LABEL = { user: "你的消息", assistant: "回复", notice: "通知", error: "错误", call: "调用", result: "结果", comparison: "独立比较", experiment: "实验", idea: "想法" };
 const DEBOUNCE_MS = 250;
 
 export function mountSearch(root, ctx) {

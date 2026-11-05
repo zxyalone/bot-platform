@@ -312,6 +312,10 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
     if (parts[1] === "groups" && parts[2]) {
       const cur = o.store.getGroup(parts[2]);
       if (!cur) throw new HttpError(404, "群聊不存在");
+      if (m === "POST" && parts[3] === "compare") {
+        const body = await readJson(req);
+        return json(res, 202, await engine.startComparison(cur.id, typeof body.conversationId === "string" ? body.conversationId : null, messageText(body), body.bots, body.synthesizer, attachmentIds(body)));
+      }
       if (m === "POST" && parts[3] === "messages") {
         const body = await readJson(req);
         const text = messageText(body);

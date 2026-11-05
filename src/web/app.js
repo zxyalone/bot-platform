@@ -1153,6 +1153,7 @@ function renderComposer(entity) {
       h("input", { id: "file-input", type: "file", multiple: true, hidden: true, onchange: (e) => { void addFiles([...e.target.files]); e.target.value = ""; } }),
       h("button", { class: "icon-btn attach-btn", type: "button", title: "添加文件，也可以直接拖进来或粘贴", "aria-label": "添加文件", onclick: () => $("file-input").click() }, icon("attach", 17)),
       box,
+      h("button", { id: "compare-btn", class: "steer-btn", type: "button", hidden: true, title: "让几个 Bot 分别回答同一个问题，再比较分歧", onclick: openCompareDialog }, "独立比较"),
       h("button", { id: "steer-btn", class: "steer-btn", type: "button", hidden: true, title: "把这条消息补充进正在进行的这一轮", onclick: () => followUp("steer") }, "立即补充"),
       h("button", { id: "stop-btn", class: "send-btn stop", type: "button", hidden: true, title: "停止回复", "aria-label": "停止回复", onclick: stopTurn }, icon("stop", 17)),
       h("button", { id: "send-btn", class: "send-btn", type: "button" }),
@@ -1187,6 +1188,7 @@ function renderComposerState() {
   $("stop-btn").hidden = !running;
   const steer = $("steer-btn");
   steer.hidden = !(running && canSteer());
+  $("compare-btn").hidden = running || !currentGroup() || groupMembers(currentGroup()).length < 2;
   steer.disabled = state.sending;
   const hint = $("composer-hint");
   if (hint) hint.textContent = !running ? "Enter 发送，Shift + Enter 换行" : canSteer() ? "Enter 排队，这一轮结束后发出；⌘/Ctrl + Enter 立即补充" : "Enter 排队，这一轮结束后发出。这个 agent 或群聊不能中途补充";
@@ -1240,6 +1242,116 @@ function renderActivity() {
   bar.replaceChildren(h("span", { class: "status-dot small" }), h("span", { class: "activity-text" }, a.text), h("span", { class: "activity-time" }, sinceLabel(idle)));
   if (stale) bar.append(h("span", { class: "activity-stale" }, "很久没有新动静了，可能还在长时间执行，也可能卡住了。可以再等等，或者点停止。"));
   state.activityTimer = setTimeout(renderActivity, 5000);
+}
+
+const ANSWER_STATE = { waiting: "排队中", running: "回答中", done: "完成", failed: "失败", timeout: "超时", interrupted: "已停止" };
+
+function comparisonNode(item, attrs) {
+  const d = item.data;
+  const s = d.synthesis;
+  const markdown = (text) => {
+    const el = h("div", { class: "md" });
+    el.innerHTML = renderMarkdown(text ?? ""); // Output of the escaping renderer in markdown.js.
+    return el;
+  };
+  const answer = (a) =>
+    h(
+      "details",
+      { class: `compare-answer ${a.status}`, open: a.status === "done" && d.answers.length <= 3 ? true : null },
+      h("summary", {}, h("strong", {}, a.bot), h("span", { class: "muted small" }, `${AGENT_LABEL[a.agent]} · ${modelLabel(a.model)}`), h("span", { class: "spacer" }), h("span", { class: "tool-status" }, [ANSWER_STATE[a.status] ?? a.status, a.tokens ? compact(a.tokens) : ""].filter(Boolean).join(" · "))),
+      a.status === "done" ? markdown(a.text) : a.reason ? h("p", { class: "small" }, a.reason) : null,
+    );
+  const ask = (bot, topic, view) => fillComposer(`@${bot} 关于“${topic}”，你认为“${view}”。请再核对一下依据，并说明对方的看法错在哪里，或者你可能错在哪里。`);
+  const lists = !s
+    ? []
+    : s.raw
+      ? [h("div", { class: "result-section" }, h("p", { class: "call-label" }, "归纳（没有按格式输出，原样显示）"), markdown(s.raw))]
+      : [
+          s.consensus.length ? h("div", { class: "result-section" }, h("p", { class: "call-label" }, "一致的地方"), h("ul", {}, s.consensus.map((c) => h("li", {}, c)))) : null,
+          h(
+            "div",
+            { class: "result-section" },
+            h("p", { class: "call-label" }, `分歧 ${s.disagreements.length}`),
+            s.disagreements.length
+              ? s.disagreements.map((x) =>
+                  h(
+                    "div",
+                    { class: "compare-topic" },
+                    h("strong", {}, x.topic),
+                    x.positions.map((p) => h("div", { class: "compare-position" }, h("div", {}, h("strong", {}, `${p.bot}：`), p.view, p.evidence ? h("p", { class: "muted small" }, `依据：${p.evidence}`) : h("p", { class: "muted small" }, "没有给出依据")), h("button", { type: "button", title: "在输入框里写好追问，由你确认后发送", onclick: () => ask(p.bot, x.topic, p.view) }, "追问"))),
+                  ),
+                )
+              : h("p", { class: "muted small" }, "归纳没有列出分歧。这不代表它们真的一致，可以对照上面的原始回答。"),
+          ),
+          s.gaps.length ? h("div", { class: "result-section" }, h("p", { class: "call-label" }, "只有部分提到或都没回答"), h("ul", {}, s.gaps.map((c) => h("li", {}, c)))) : null,
+        ];
+  const title = { running: d.summarizing ? `${d.summarizer} 正在归纳` : "各自回答中，彼此看不到", done: "独立比较完成", partial: "独立比较没有完成", interrupted: "独立比较被停止了", failed: "独立比较失败了" }[item.status] ?? "独立比较";
+  return h(
+    "div",
+    { ...attrs, class: `result-card compare-card ${item.status}` },
+    h("div", { class: "result-head" }, h("strong", {}, title)),
+    d.note || d.error ? h("p", { class: "small" }, d.note ?? d.error) : null,
+    h("div", { class: "compare-answers" }, d.answers.map(answer)),
+    ...lists.filter(Boolean),
+    s ? h("p", { class: "muted small" }, `归纳由 ${d.summarizer} 生成，是模型的概括，平台没有核实。依据是否成立，请对照原始回答。`) : null,
+  );
+}
+
+function openCompareDialog() {
+  const group = currentGroup();
+  const box = $("composer-input");
+  if (!group || !box) return;
+  if (!box.value.trim() && !readyFiles().length) {
+    state.sendError = "先在输入框里写好要比较的问题";
+    return renderComposerState();
+  }
+  const dlg = $("bot-dialog");
+  const members = groupMembers(group).filter((m) => !m.paused);
+  const picks = members.map((m) => ({ m, input: h("input", { type: "checkbox", checked: true, "aria-label": m.name }) }));
+  const pick = h("select", { "aria-label": "归纳者" }, members.map((m) => h("option", { value: m.id }, m.name)));
+  pick.value = (members.find((m) => m.is_chief) ?? members[0]).id;
+  const error = h("p", { class: "send-error", role: "alert", hidden: true });
+  const start = async () => {
+    const bots = picks.filter((p) => p.input.checked).map((p) => p.m.id);
+    if (uploadPending()) return blockForUpload();
+    try {
+      const conv = await api(`/api/groups/${group.id}/compare`, { method: "POST", body: { text: box.value, conversationId: state.convId, bots, synthesizer: pick.value, attachments: readyFiles().map((f) => f.id) } });
+      clearFiles();
+      state.drafts.delete(draftKey());
+      box.value = "";
+      autoGrow(box);
+      state.sendError = null;
+      renderComposerState();
+      dlg.close();
+      if (state.convId !== conv.id) {
+        state.convId = conv.id;
+        box.dataset.draftKey = draftKey();
+        const { items } = await api(`/api/conversations/${conv.id}/items`);
+        state.items = items;
+        writeHash();
+        renderChatTitle();
+        renderSidebar();
+        renderTimeline({ scroll: true });
+      }
+    } catch (e) {
+      error.hidden = false;
+      error.textContent = e.message;
+    }
+  };
+  setChildren(
+    dlg,
+    h(
+      "div",
+      {},
+      h("h2", {}, "独立比较"),
+      h("p", { class: "muted small" }, "选中的 Bot 各开一个新会话，只看到这个问题和工作目录，看不到彼此和之前的群聊。回答时只读，不能改文件。花费大约是单次回答的“人数 + 1”倍，计入这个群的每轮预算。"),
+      h("div", { class: "budget-form" }, picks.map((p) => h("label", { class: "check" }, p.input, p.m.name))),
+      h("div", { class: "budget-form" }, h("label", {}, "归纳者", pick)),
+      error,
+      h("div", { class: "dialog-actions" }, h("span", { class: "spacer" }), h("button", { type: "button", onclick: () => dlg.close() }, "取消"), h("button", { type: "button", class: "primary", onclick: start }, "开始")),
+    ),
+  );
+  dlg.showModal();
 }
 
 function resultNode(item, attrs) {
@@ -1417,6 +1529,8 @@ function itemNode(item) {
       );
     case "result":
       return resultNode(item, attrs);
+    case "comparison":
+      return comparisonNode(item, attrs);
     case "assistant": {
       const body = h("div", { class: "md" });
       body.innerHTML = renderMarkdown(d.text); // Output of the escaping renderer in markdown.js.

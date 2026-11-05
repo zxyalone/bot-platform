@@ -20,6 +20,9 @@ export { HttpError };
 const MAX_BOTS = 12;
 export const STEERABLE: AgentKind[] = ["claude", "codex"];
 const MAX_QUEUED = 10;
+const MAX_COMPARED = 6;
+const COMPARE_ANSWER = 12000;
+const COMPARE_ITEMS = 12;
 const BUDGET_WARN_AT = 0.8;
 const NOTIFY_TEXT = 120;
 const ACTIVITY_MS = 300;
@@ -86,6 +89,8 @@ interface CallRun {
   question: string;
   worktree: Worktree | null;
   retryNote?: string;
+  // Replaces the usual "a colleague asks" framing.
+  prompt?: string;
   task?: TaskRun;
 }
 
@@ -170,6 +175,27 @@ export function parseMentions(text: string, members: Bot[]): Bot[] {
     .sort((a, b) => a.at - b.at)
     .map((h) => h.bot)
     .filter((b) => !seen.has(b.id) && Boolean(seen.add(b.id)));
+}
+
+const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x) => typeof x === "string" && x.trim()).slice(0, COMPARE_ITEMS).map((x: string) => clip(x, 1000)) : []);
+
+// A model wrote this, so nothing in it is trusted: a position naming a Bot that did not answer is dropped.
+export function parseSynthesis(text: string, names: string[]) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  try {
+    const raw = JSON.parse(text.slice(start, end + 1));
+    return {
+      consensus: strings(raw.consensus),
+      disagreements: (Array.isArray(raw.disagreements) ? raw.disagreements : []).slice(0, COMPARE_ITEMS).map((d: any) => ({
+        topic: clip(String(d?.topic ?? ""), 300),
+        positions: (Array.isArray(d?.positions) ? d.positions : []).filter((p: any) => names.includes(p?.bot)).map((p: any) => ({ bot: p.bot, view: clip(String(p.view ?? ""), 1000), evidence: clip(String(p.evidence ?? ""), 1000) })),
+      })).filter((d: any) => d.topic && d.positions.length),
+      gaps: strings(raw.gaps),
+    };
+  } catch {
+    return { raw: clip(text, COMPARE_ANSWER) };
+  }
 }
 
 export const effectiveTokens = (u: { inputTokens: number; cachedTokens: number; outputTokens: number }) => Math.max(0, u.inputTokens - u.cachedTokens) + u.outputTokens;
@@ -818,6 +844,104 @@ export class Engine {
     return this.store.getConversation(conv.id)!;
   }
 
+  // ---------- answering independently, then comparing ----------
+  // Group members normally read each other. Here they must not: each gets a new session and only the question.
+  // Answering is read-only, so several Bots cannot trip over each other in one directory.
+  async startComparison(groupId: string, conversationId: string | null, question: string, botIds: unknown, synthesizer: unknown, attachments: string[] = []) {
+    const group = this.store.getGroup(groupId);
+    if (!group) throw new HttpError(404, "群聊不存在");
+    const members = this.store.groupMembers(groupId);
+    const wanted = Array.isArray(botIds) ? botIds : members.map((m) => m.id);
+    const bots = members.filter((m) => wanted.includes(m.id) && !m.paused);
+    if (bots.length < 2) throw new HttpError(400, "至少要选 2 个没有暂停的成员");
+    if (bots.length > MAX_COMPARED) throw new HttpError(400, `最多 ${MAX_COMPARED} 个 Bot 同时比较`);
+    const summarizer = synthesizer ? members.find((m) => m.id === synthesizer && !m.paused) : (bots.find((m) => m.is_chief) ?? bots[0]);
+    if (!summarizer) throw new HttpError(400, "归纳者要是这个群里没有暂停的成员");
+    this.checkCanStart((conversationId && this.store.getConversation(conversationId)?.cwd) || group.cwd);
+    const conv = conversationId ? this.store.getConversation(conversationId) : this.store.createGroupConversation(group, question.trim().split("\n")[0].slice(0, 40) || "独立比较");
+    if (!conv || conv.group_id !== groupId) throw new HttpError(404, "对话不存在");
+    if (conv.status === "running") throw new HttpError(409, "这个对话还在回复中");
+    if (!conversationId) this.broadcast({ type: "conversation", conversation: conv });
+
+    const files = this.artifacts.attach(conv.cwd, conv.id, attachments);
+    const text = question + files.footer;
+    const request = this.addItem(conv.id, null, "user", "done", { text, ...(files.list.length ? { attachments: files.list } : {}) });
+    const card = this.addItem(conv.id, null, "comparison", "running", {
+      question,
+      summarizer: summarizer.name,
+      answers: bots.map((b) => ({ bot: b.name, bot_id: b.id, agent: b.agent, model: b.model, status: "waiting", text: "", tokens: 0 })),
+      synthesis: null,
+    });
+    this.setConversation(conv.id, { status: "running" });
+    const root = this.openRoot(conv.id, group.budget_tokens);
+    root.requestItem = request.id;
+    void this.runComparison(conv, bots, summarizer, text, root, card.id)
+      .catch((e) => {
+        const cur = this.store.getItem(card.id);
+        if (cur) this.updateItem(card.id, { status: "failed", data: { ...cur.data, error: (e as Error).message } });
+      })
+      .finally(() => this.closeRoot(root));
+    return this.store.getConversation(conv.id)!;
+  }
+
+  private async runComparison(conv: Conversation, bots: Bot[], summarizer: Bot, question: string, root: RootTurn, cardId: string) {
+    // Everyone in the chain, so the existing loop check refuses a participant asking another for its answer.
+    const chain = bots.map((b) => b.id);
+    const ctx: TurnCtx = { root, displayConvId: conv.id, depth: 0, chain, callId: null, callPath: [], speaker: null };
+    const others = bots.length - 1;
+    const prompt = `这是一次独立比较：你和另外 ${others} 个 Bot 分别回答同一个问题，彼此看不到对方的回答，也看不到之前的群聊。请独立完成：不要调用其他 Bot，也不要修改文件。先给结论，再给依据；依据要能核对，写明文件路径、命令结果或来源。不确定的地方直接说不确定。\n\n问题：\n${question}`;
+    const update = (bot: Bot, patch: Record<string, unknown>) => {
+      const cur = this.store.getItem(cardId)!;
+      this.updateItem(cardId, { data: { ...cur.data, answers: (cur.data.answers as Record<string, unknown>[]).map((a) => (a.bot_id === bot.id ? { ...a, ...patch } : a)) } });
+    };
+    const runs = bots.map((bot) => {
+      const child = this.store.createChild("call", conv.id, bot, conv.cwd, `独立比较 / ${bot.name}`);
+      const callId = randomUUID();
+      this.store.addCall({ id: callId, rootTurnId: root.id, rootConvId: conv.id, callerConvId: conv.id, childConvId: child.id, parentCallId: null, from: "你", to: bot.name, mode: "compare", depth: 1, question, status: "waiting", chain, timeoutMs: this.taskTimeout(NaN) });
+      root.callCount++;
+      const target = { ...bot, permission: "read_only" as const };
+      const task = this.launchTask({ callId, itemId: "", callerName: "你", ctx, target, child, question, worktree: null, prompt }, [], this.taskTimeout(NaN), true);
+      return task.done.then(() => {
+        const row = this.store.getCall(callId)!;
+        update(bot, { status: row.status, text: clip(String(row.answer ?? ""), COMPARE_ANSWER), tokens: row.tokens, reason: row.status === "done" ? null : row.reason });
+        return { bot, status: row.status as string, text: String(row.answer ?? "") };
+      });
+    });
+    // The card shows who has started; nothing else reports that.
+    const watch = setInterval(() => {
+      const cur = this.store.getItem(cardId);
+      if (!cur) return;
+      const started = (cur.data.answers as { bot_id: string; status: string }[]).filter((a) => a.status === "waiting" && [...root.tasks.values()].some((t) => t.state === "running" && t.target.id === a.bot_id));
+      for (const a of started) update(bots.find((b) => b.id === a.bot_id)!, { status: "running" });
+    }, 300);
+    watch.unref();
+    const results = await Promise.all(runs);
+    clearInterval(watch);
+
+    const finish = (status: string, patch: Record<string, unknown> = {}) => {
+      const cur = this.store.getItem(cardId)!;
+      this.updateItem(cardId, { status, data: { ...cur.data, ...patch } });
+    };
+    const good = results.filter((r) => r.status === "done");
+    if (root.stopping) return finish("interrupted");
+    if (good.length < 2) return finish("partial", { note: "完成回答的不到 2 个，没有可比较的内容" });
+    finish("running", { summarizing: true });
+    const child = this.store.createChild("call", conv.id, summarizer, conv.cwd, "独立比较 / 归纳");
+    const asked = `下面是 ${good.length} 个 Bot 对同一个问题的独立回答。请比较它们，不要加入你自己的新结论，也不要判断谁对。\n\n只输出一个 JSON 对象，不要其他文字：\n{"consensus": ["各方一致的结论"], "disagreements": [{"topic": "分歧点", "positions": [{"bot": "Bot 名字", "view": "它的看法", "evidence": "它给出的依据，没有就留空"}]}], "gaps": ["只有部分 Bot 提到、或各方都没回答的地方"]}\n\n问题：\n${question}\n\n${good.map((r) => `--- ${r.bot.name} 的回答 ---\n${clip(r.text, COMPARE_ANSWER)}`).join("\n\n")}`;
+    const r = await this.runTurn({ ...summarizer, permission: "read_only" }, child.id, asked, { root, displayConvId: child.id, depth: 1, chain: [...chain, summarizer.id], callId: null, callPath: [], speaker: null });
+    if (r.status !== "completed") {
+      if (r.status === "failed") root.failed = false; // The answers are still good; the card says what is missing.
+      return finish("partial", { summarizing: false, note: r.status === "failed" ? `归纳失败：${r.error ?? "没有原因"}` : "归纳被停止了" });
+    }
+    root.lastText = `独立比较完成：${good.map((g) => g.bot.name).join("、")}`;
+    finish("done", { summarizing: false, synthesis: parseSynthesis(r.text, good.map((g) => g.bot.name)) });
+  }
+
+  private comparisonForMembers(d: Record<string, any>) {
+    const answers = (d.answers as { bot: string; status: string; text: string }[]).filter((a) => a.status === "done").map((a) => `[${a.bot} 的独立回答]：${a.text}`);
+    return [`[独立比较的问题]：${d.question}`, ...answers].join("\n\n");
+  }
+
   // One at a time, so each Bot reads what the previous one just said.
   private async runGroupRound(group: Group, conv: Conversation, mentioned: Bot[], members: Bot[], root: RootTurn, instruction = "") {
     for (const bot of mentioned) {
@@ -852,6 +976,7 @@ export class Engine {
       if (by?.id === bot.id) continue;
       if (i.type === "user") lines.push(`[用户]：${i.data.text}`);
       else if (i.type === "assistant" && i.data.text) lines.push(`[${by?.name ?? "Bot"}]：${i.data.text}`);
+      else if (i.type === "comparison") lines.push(this.comparisonForMembers(i.data));
       else if (i.type === "notice" && !i.data.local) lines.push(`[平台通知，不是用户发的]：${i.data.text}`);
     }
     const transcript = lines.join("\n\n");
@@ -1432,7 +1557,7 @@ export class Engine {
     const { callId, itemId, ctx, target, child, worktree, task } = c;
     const chainNames = [...ctx.chain.map((id) => this.store.getBot(id)?.name ?? "?"), target.name].join(" → ");
     const deps = (task?.dependsOn ?? []).map((id) => this.store.latestAttempt(id)!).map((d) => `\n\n它依赖的任务（${d.to_bot}：${firstLine(d.question)}）已完成，结论：\n${clip(String(d.answer ?? ""), DEP_ANSWER)}`);
-    const prompt = `这是来自同事 Bot ${c.callerName} 的请求（调用链：${chainNames}）。请完成它，并在最后一条回复里直接给出结论，对方只能看到这条回复。${worktree ? `\n\n你在独立的 Git 工作树里工作（分支 ${worktree.branch}），改动不会影响别人。不用提交，用户验收后平台会统一提交。` : ""}${c.retryNote ? `\n\n${c.retryNote}` : ""}${deps.join("")}\n\n${c.question}`;
+    const prompt = c.prompt ?? `这是来自同事 Bot ${c.callerName} 的请求（调用链：${chainNames}）。请完成它，并在最后一条回复里直接给出结论，对方只能看到这条回复。${worktree ? `\n\n你在独立的 Git 工作树里工作（分支 ${worktree.branch}），改动不会影响别人。不用提交，用户验收后平台会统一提交。` : ""}${c.retryNote ? `\n\n${c.retryNote}` : ""}${deps.join("")}\n\n${c.question}`;
     const turn = this.runTurn(target, child.id, prompt, { root: ctx.root, displayConvId: child.id, depth: ctx.depth + 1, chain: [...ctx.chain, target.id], callId, callPath: [...ctx.callPath, callId], speaker: null });
     const r = await (task ? Promise.race([turn, task.forced]) : turn);
     this.sessionsInUse.delete(child.id);

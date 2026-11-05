@@ -34,9 +34,10 @@ const ITEM_TEXT = `CASE i.type
   WHEN 'notice' THEN json_extract(i.data, '$.text')
   WHEN 'error' THEN json_extract(i.data, '$.message')
   WHEN 'call' THEN COALESCE(json_extract(i.data, '$.from'), '') || ' ' || COALESCE(json_extract(i.data, '$.to'), '') || ' ' || COALESCE(json_extract(i.data, '$.question'), '') || ' ' || COALESCE(json_extract(i.data, '$.answer'), '')
+  WHEN 'comparison' THEN COALESCE(json_extract(i.data, '$.question'), '') || ' ' || COALESCE((SELECT group_concat(json_extract(value, '$.bot') || ' ' || COALESCE(json_extract(value, '$.text'), ''), ' ') FROM json_each(i.data, '$.answers')), '')
   WHEN 'result' THEN COALESCE(json_extract(i.data, '$.summary'), '') || ' ' || COALESCE((SELECT group_concat(json_extract(value, '$.path'), ' ') FROM json_each(i.data, '$.files')), '')
 END`;
-const ITEM_TYPES: Record<string, string[]> = { message: ["user", "assistant", "notice", "error"], task: ["call"], file: ["result"] };
+const ITEM_TYPES: Record<string, string[]> = { message: ["user", "assistant", "notice", "error", "comparison"], task: ["call"], file: ["result"] };
 const KIND_OF: Record<string, string> = { call: "task", result: "file" };
 
 function snippet(text: string, terms: string[]) {
@@ -66,7 +67,7 @@ export function search(store: Store, query: SearchQuery) {
   };
 
   // A status says nothing about a message, so filtering by one leaves out plain chat.
-  const types = Object.entries(ITEM_TYPES).filter(([k]) => wants(k)).flatMap(([, t]) => t).filter((t) => !statuses || !["user", "assistant", "notice"].includes(t));
+  const types = Object.entries(ITEM_TYPES).filter(([k]) => wants(k)).flatMap(([, t]) => t).filter((t) => !statuses || !["user", "assistant", "notice", "comparison"].includes(t));
   if (types.length) {
     const where: string[] = [];
     const args: unknown[] = [];

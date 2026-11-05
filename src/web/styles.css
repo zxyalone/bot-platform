@@ -395,6 +395,15 @@ summary::-webkit-details-marker { display: none; }
 .artifact-preview .diff-view { max-height: 60vh; overflow: auto; }
 .artifact-row .path { overflow-wrap: anywhere; margin: 0; }
 a.button { display: inline-flex; align-items: center; padding: 4px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); text-decoration: none; font-size: 0.82rem; }
+.compare-answers { display: grid; gap: 6px; }
+.compare-answer { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+.compare-answer summary { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.compare-answer .md { margin-top: 8px; max-height: 360px; overflow: auto; }
+.compare-topic { margin: 6px 0 10px; font-size: 0.85rem; }
+.compare-position { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 5px 0 5px 10px; border-left: 2px solid var(--line); margin-top: 5px; }
+.compare-position p { margin: 2px 0 0; }
+.compare-position button { flex: none; padding: 2px 8px; font-size: 0.74rem; }
+.compare-card .result-section ul { margin: 0; padding-left: 18px; font-size: 0.85rem; }
 .module-row { display: flex; gap: 10px; align-items: flex-start; font-size: 0.85rem; }
 .module-row > span { flex: 1; }
 .module-row button { padding: 2px 10px; font-size: 0.82rem; flex: none; }

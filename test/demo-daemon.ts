@@ -58,7 +58,14 @@ class Scripted implements AgentRuntime {
     const e = this.o.onEvent;
     e({ type: "usage_tick", tokens: 2500 });
     const name = this.o.systemPrompt.match(/DEMO:(\w+)/)?.[1];
-    if (/^接手 /.test(prompt)) {
+    if (/^下面是 \d+ 个 Bot/.test(prompt)) {
+      const names = [...prompt.matchAll(/--- (\S+) 的回答 ---/g)].map((m) => m[1]);
+      await wait(800);
+      await this.stream(JSON.stringify({ consensus: ["都认为要处理空预测"], disagreements: [{ topic: "分母是否要加 eps", positions: names.map((bot, i) => ({ bot, view: i ? "不用，先判空就够了" : "要加，数值更稳", evidence: i ? "" : "boundary_loss.py 第 2 行" })) }], gaps: ["都没有提到类别不平衡"] }));
+    } else if (/^这是一次独立比较/.test(prompt)) {
+      await wait(1500);
+      await this.stream(`结论：${name} 建议先处理空预测。这是脚本回复。`);
+    } else if (/^接手 /.test(prompt)) {
       await this.stream("我先看看现状，确认上一位做到哪了，再接着做。这是脚本回复，没有消耗额度。");
     } else if (name === "Chief") {
       if (/会失败/.test(prompt) && !/重试上一步/.test(prompt)) {
