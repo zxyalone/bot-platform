@@ -5,6 +5,7 @@ import { mountResearch } from "./research.js";
 import { mountSettings } from "./settings.js";
 import { mountTasks, TASK_STATUS } from "./tasks.js";
 import { mountInbox } from "./inbox.js";
+import { mountSearch } from "./search.js";
 import { draftKey as keyFor, loadDrafts, saveDrafts } from "./drafts.js";
 
 const AGENT_LABEL = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", antigravity: "Antigravity" };
@@ -643,7 +644,7 @@ function renderSidebar() {
     h("div", { class: "bot-list" }, groupRows.length ? groupRows : h("p", { class: "empty-hint" }, "把几个 Bot 拉进群聊，需要谁就 @ 谁。")),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "Bots"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建 Bot", title: "新建 Bot", onclick: () => openBotDialog() }, icon("plus", 16))),
     h("div", { class: "bot-list" }, rows.length ? rows : h("p", { class: "empty-hint" }, "还没有 Bot，先建一个。")),
-    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", waitingCount() ? h("span", { class: "inbox-count", "aria-label": `${waitingCount()} 项待处理` }, String(waitingCount())) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
+    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "search" ? " on" : ""}`, type: "button", title: "⌘K 或 Ctrl+K", onclick: openSearch }, icon("search", 16), "搜索"), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", waitingCount() ? h("span", { class: "inbox-count", "aria-label": `${waitingCount()} 项待处理` }, String(waitingCount())) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
   );
 }
 
@@ -741,7 +742,7 @@ function agentWarning(bot) {
   return null;
 }
 
-function openResearch() {
+function openResearch(tab) {
   saveDraft();
   state.view = "research";
   const entity = currentEntity();
@@ -749,6 +750,7 @@ function openResearch() {
     api,
     h,
     projectId: entity.project_memory,
+    tab: typeof tab === "string" ? tab : undefined,
     title: entity.cwd,
     onBack: () => {
       leaveResearch();
@@ -796,6 +798,48 @@ async function jumpToItem(entry) {
   node.classList.add("item-flash");
   setTimeout(() => node.classList.remove("item-flash"), 2000);
 }
+
+// What was typed survives going to a result and coming back.
+const searchState = { q: "", kind: "", cwd: "", bot: "", time: "", status: "", results: null, more: false, error: null };
+
+function openSearch() {
+  saveDraft();
+  state.view = "search";
+  state.sidebarOpen = false;
+  $("app").classList.remove("sidebar-open");
+  $("app").classList.add("full-page");
+  const cwds = [...new Set([...state.bots, ...state.groups].map((e) => e.cwd))];
+  state.page = mountSearch($("main"), {
+    api,
+    h,
+    ui: searchState,
+    projects: cwds.map((c) => [c, c.split("/").filter(Boolean).slice(-2).join("/")]),
+    bots: state.bots.map((b) => [b.id, b.name]),
+    onBack: () => {
+      leaveResearch();
+      render({ focus: true });
+    },
+    onOpen: openSearchResult,
+  });
+  renderSidebar();
+}
+
+async function openSearchResult(r) {
+  if (r.conv_id) return jumpToItem(r);
+  // Experiments and ideas live on the project's page, reached through anyone working in that directory.
+  const owner = [...state.groups, ...state.bots].find((e) => e.project_memory === r.project_id);
+  if (!owner) return;
+  await (state.groups.includes(owner) ? selectGroup(owner.id) : selectBot(owner.id));
+  openResearch(r.type === "idea" ? "ideas" : "experiments");
+}
+
+window.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k" && !e.isComposing) {
+    e.preventDefault();
+    if (state.view === "search") document.querySelector(".search-box")?.select();
+    else openSearch();
+  }
+});
 
 function openTasks() {
   saveDraft();

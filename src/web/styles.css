@@ -303,6 +303,13 @@ summary::-webkit-details-marker { display: none; }
 .inbox-line .inbox-row { flex: 1; min-width: 0; margin-bottom: 0; }
 .inbox-row { display: grid; gap: 2px; justify-content: start; justify-items: start; width: 100%; padding: 9px 12px; margin-bottom: 6px; text-align: left; }
 .inbox-title { overflow-wrap: anywhere; }
+.search-bar { padding: 12px 20px 8px; background: var(--panel); }
+.search-box { width: 100%; }
+.search-filters { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 20px 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.search-filters select { max-width: 180px; font-size: 0.8rem; }
+.search-row { display: grid; gap: 3px; justify-items: start; width: 100%; padding: 9px 12px; margin-bottom: 6px; text-align: left; }
+.search-text { overflow-wrap: anywhere; white-space: normal; }
+.search-row mark { background: var(--accent-soft); color: var(--accent-text); border-radius: 3px; padding: 0 1px; }
 .queued-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 0.8rem; }
 .queued-row.unsent { border-style: dashed; }
 .queued-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

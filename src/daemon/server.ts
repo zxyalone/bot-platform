@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { summarize } from "./research.ts";
+import { search } from "./search.ts";
 import { readQuotas, type QuotaReport } from "./quota.ts";
 import { refineRole, type RefineInput } from "./refine.ts";
 import { CHIEF_ROLE, SETTING_DEFAULTS, type AppSettings } from "./store.ts";
@@ -25,6 +26,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/tasks.js": { file: "tasks.js", type: "text/javascript; charset=utf-8" },
   "/inbox.js": { file: "inbox.js", type: "text/javascript; charset=utf-8" },
   "/drafts.js": { file: "drafts.js", type: "text/javascript; charset=utf-8" },
+  "/search.js": { file: "search.js", type: "text/javascript; charset=utf-8" },
   "/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" },
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -332,6 +334,16 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
     if (m === "GET" && pathname === "/api/tasks") {
       const conv = new URL(req.url ?? "/", "http://localhost").searchParams.get("conv");
       return json(res, 200, { tasks: engine.listTasks(conv || null) });
+    }
+    if (m === "GET" && pathname === "/api/search") {
+      const p = new URL(req.url ?? "/", "http://localhost").searchParams;
+      const q = p.get("q") ?? "";
+      if (q.length > 200) throw new HttpError(400, "关键词太长");
+      const time = (k: string) => {
+        const v = Number(p.get(k));
+        return Number.isFinite(v) && v > 0 ? v : undefined;
+      };
+      return json(res, 200, search(o.store, { q, kind: p.get("kind") || undefined, cwd: p.get("cwd") || undefined, bot: p.get("bot") || undefined, status: p.get("status") || undefined, since: time("since"), until: time("until") }));
     }
     if (m === "GET" && pathname === "/api/inbox") return json(res, 200, { items: engine.listInbox() });
     if (m === "POST" && parts[1] === "tasks" && parts[2] && parts[3] === "cancel") {

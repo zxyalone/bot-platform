@@ -8,7 +8,7 @@ const fmt = (v) => (typeof v === "number" ? (Number.isInteger(v) ? String(v) : v
 
 export function mountResearch(root, ctx) {
   const { api, h, projectId, title, onBack, openDialog } = ctx;
-  const ui = { tab: "ideas", data: null, error: null, picked: new Set(), metric: null, overlay: false, shown: 30, manifests: new Map() };
+  const ui = { tab: ctx.tab ?? "ideas", data: null, error: null, picked: new Set(), metric: null, overlay: false, shown: 30, manifests: new Map() };
 
   const act = async (fn) => {
     try {
