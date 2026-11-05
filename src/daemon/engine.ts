@@ -396,12 +396,15 @@ export class Engine {
     if (!b.total.limit && !b.today.limit) return;
     const over = this.overBudget(root.cwd);
     if (over) {
-      if (root.overBudget) return;
-      root.overBudget = true;
-      root.projectOver = true;
-      this.addItem(root.convId, null, "error", "done", { message: `${over}。这一轮已自动停止。` });
-      this.notify(root.convId, "budget", over);
-      this.stopRoot(root, "这个项目的预算用完了，已停止");
+      // The budget is the project's, so everything spending from it stops, not just the round that crossed the line.
+      const spending = [...this.roots.values()].filter((r) => r.cwd === root.cwd && !r.projectOver);
+      for (const r of spending) {
+        r.overBudget = true;
+        r.projectOver = true;
+        this.addItem(r.convId, null, "error", "done", { message: `${over}。这一轮已自动停止。` });
+        this.notify(r.convId, "budget", over);
+      }
+      for (const r of spending) this.stopRoot(r, "这个项目的预算用完了，已停止");
       return;
     }
     const day = new Date().toDateString();
@@ -1480,7 +1483,7 @@ export class Engine {
       const dependsOn = s.depends_on.map((d) => taskIds.get(d)!);
       const timeoutMs = this.taskTimeout(NaN);
       const body = s.acceptance ? `${s.task}\n\n验收条件（用户确认过）：\n${s.acceptance}\n\n做完后逐条说明是否满足，不满足的直接说。` : s.task;
-      const prepared = await this.prepareCall(l, ctx, s.bot, body, "task", { isolated: s.isolated, dependsOn, timeoutMs });
+      const prepared = await this.prepareCall(l, ctx, s.bot, body, "task", { isolated: s.isolated, dependsOn, timeoutMs, queue: true });
       if ("refused" in prepared) {
         out.push({ id: s.id, bot: s.bot, status: "refused", reason: prepared.refused });
         continue;
@@ -1623,7 +1626,7 @@ export class Engine {
     return ceiling ? Math.min(askedMs, ceiling) : askedMs;
   }
 
-  private async prepareCall(l: Live, ctx: TurnCtx, name: unknown, body: unknown, mode: string, place: { isolated: boolean; workspace?: string; dependsOn: string[]; timeoutMs: number }): Promise<{ refused: string } | { callId: string; itemId: string; target: Bot; child: Conversation; worktree: Worktree | null; queued: boolean }> {
+  private async prepareCall(l: Live, ctx: TurnCtx, name: unknown, body: unknown, mode: string, place: { isolated: boolean; workspace?: string; dependsOn: string[]; timeoutMs: number; queue?: boolean }): Promise<{ refused: string } | { callId: string; itemId: string; target: Bot; child: Conversation; worktree: Worktree | null; queued: boolean }> {
     const root = ctx.root;
     const refuse = (reason: string, to = String(name ?? "?")) => {
       const id = randomUUID();
@@ -1635,7 +1638,8 @@ export class Engine {
     if (typeof body !== "string" || !body.trim()) return refuse("问题不能为空");
     const target = this.store.listBots().find((b) => b.name.toLowerCase() === String(name ?? "").trim().toLowerCase());
     if (!target) return refuse(`没有叫 ${String(name)} 的 Bot，请先用 list_bots 查看`);
-    const deferred = place.dependsOn.length > 0;
+    // Someone approved all of a plan, so a step over the concurrency limit waits for a slot rather than being refused.
+    const deferred = place.dependsOn.length > 0 || place.queue === true;
     const refusal = this.callRefusal(l.bot, target, ctx, root, deferred) ?? this.dependencyRefusal(place.dependsOn, root.convId);
     if (refusal) return refuse(refusal, target.name);
 
@@ -1647,6 +1651,11 @@ export class Engine {
       const known = this.store.listWorktrees(root.convId).find((w) => w.status === "active" && w.path === place.workspace);
       if (!known) return refuse(`${place.workspace} 不是这个对话里的工作树`, target.name);
       cwd = known.path;
+      try {
+        this.artifacts.copyInto(root.convId, cwd);
+      } catch (e) {
+        return refuse(`附件没能放进工作树：${(e as Error).message}`, target.name);
+      }
     }
     let child = place.isolated ? undefined : this.store.findChild("call", l.convId, target.id, cwd);
     if (child && child.agent !== target.agent) child = undefined;
@@ -1666,6 +1675,8 @@ export class Engine {
         const made = await this.worktrees.create(callerCwd, target.name, root.convId);
         worktree = made.wt;
         cwd = made.cwd;
+        // Attachments are kept out of Git, so a new worktree does not have them. Same relative path, so what the task says still works.
+        this.artifacts.copyInto(root.convId, cwd);
         this.broadcast({ type: "worktrees", convId: root.convId });
       } catch (e) {
         root.callCount--;
@@ -2082,6 +2093,16 @@ export class Engine {
 
   conversationRunning(rootConvId: string) {
     return this.roots.has(rootConvId);
+  }
+
+  // The worktree's directory is gone afterwards, and a file's record has to say where it went.
+  async closeWorktree(id: string, action: "merge" | "discard") {
+    const wt = this.store.getWorktree(id);
+    const from = wt && existsSync(wt.path) ? realpathSync(wt.path) : null;
+    await (action === "merge" ? this.worktrees.merge(id) : this.worktrees.discard(id));
+    if (!wt || !from) return;
+    if (action === "merge") this.artifacts.worktreeMerged(from, realpathSync(wt.repo_root));
+    else this.artifacts.worktreeDiscarded(from);
   }
 
   // ---------- archive ----------

@@ -5,7 +5,8 @@ import { renderMarkdown } from "./markdown.js";
 const SCOPES = [["conv", "这个对话"], ["project", "整个项目"]];
 const KINDS = [["", "全部"], ["file", "产物"], ["attachment", "附件"]];
 const fileSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.ceil(n / 1024))} KB`);
-const STATE = { changed: "这一轮之后又被改过，下面显示的是现在的内容", gone: "文件已经不在了" };
+const STATE = { changed: "这一轮之后又被改过，下面显示的是现在的内容", gone: "文件已经不在了", discarded: "已随工作树丢弃" };
+const available = (a) => a.state !== "gone" && a.state !== "discarded";
 const fileUrl = (id, download) => `/api/artifacts/${id}/file${download ? "?download=1" : ""}`;
 
 // Shared with the chat, where an attachment can be opened from its message.
@@ -63,16 +64,16 @@ export function mountArtifacts(root, ctx) {
       { class: "rs-idea artifact-row" },
       h("div", { class: "rs-idea-head" }, h("strong", { class: "task-title" }, a.name), a.change ? h("span", { class: "tag" }, a.change) : null, h("span", { class: "tag" }, a.kind === "attachment" ? "附件" : "产物")),
       a.kind === "file" && a.rel !== a.name ? h("p", { class: "muted small path" }, a.rel) : null,
-      h("p", { class: "small" }, [a.origin, a.state === "gone" ? null : fileSize(a.size), new Date(a.at).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })].filter(Boolean).join(" · ")),
+      h("p", { class: "small" }, [a.origin, available(a) ? fileSize(a.size) : null, new Date(a.at).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })].filter(Boolean).join(" · ")),
       STATE[a.state] ? h("p", { class: "muted small" }, STATE[a.state]) : null,
       h(
         "div",
         { class: "task-foot" },
         a.conv_title ? h("button", { type: "button", class: "link-btn", onclick: () => onOpen(a) }, a.conv_title) : null,
         h("span", { class: "spacer" }),
-        a.state !== "gone" ? h("button", { type: "button", onclick: () => previewArtifact({ api, h, dialog }, a) }, "预览") : null,
-        a.state !== "gone" ? h("a", { class: "button", href: fileUrl(a.id, true), download: a.name }, "下载") : null,
-        a.state !== "gone" && ui.canReveal ? h("button", { type: "button", title: "只在访达中选中这个文件，不会打开它", onclick: () => reveal(a) }, "在访达中显示") : null,
+        available(a) ? h("button", { type: "button", onclick: () => previewArtifact({ api, h, dialog }, a) }, "预览") : null,
+        available(a) ? h("a", { class: "button", href: fileUrl(a.id, true), download: a.name }, "下载") : null,
+        available(a) && ui.canReveal ? h("button", { type: "button", title: "只在访达中选中这个文件，不会打开它", onclick: () => reveal(a) }, "在访达中显示") : null,
       ),
     );
 

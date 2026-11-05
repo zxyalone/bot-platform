@@ -15,7 +15,7 @@ const ATTACH_DIR = ".bot-attachments";
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS artifacts (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, path TEXT NOT NULL UNIQUE, root TEXT NOT NULL, name TEXT NOT NULL, project_cwd TEXT, conv_id TEXT, item_id TEXT,
-  origin TEXT NOT NULL DEFAULT '', change TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, mtime REAL NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  origin TEXT NOT NULL DEFAULT '', change TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, mtime REAL NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, fate TEXT
 );
 CREATE INDEX IF NOT EXISTS artifacts_project ON artifacts(project_cwd, updated_at);
 `;
@@ -35,6 +35,7 @@ export class Artifacts {
     this.store = store;
     this.revealer = reveal;
     store.db.exec(SCHEMA);
+    if (!(store.db.prepare("PRAGMA table_info(artifacts)").all() as Row[]).some((c) => c.name === "fate")) store.db.exec("ALTER TABLE artifacts ADD COLUMN fate TEXT");
     // Picked and never sent: nothing refers to these.
     for (const r of store.db.prepare("SELECT id, root FROM artifacts WHERE kind='attachment' AND conv_id IS NULL AND created_at<?").all(Date.now() - UNSENT_KEEP_MS) as Row[]) {
       rmSync(join(r.root as string, r.id as string), { recursive: true, force: true });
@@ -79,6 +80,40 @@ export class Artifacts {
     return { footer: `\n\n${ATTACH_MARK}\n${lines.join("\n")}`, list: rows.map((r) => ({ id: r.id as string, name: r.name as string, size: r.size as number, preview: this.previewKind(r.name, r.size) })) };
   }
 
+  // Into a worktree, at the same relative path the message already gave.
+  copyInto(convId: string, cwd: string) {
+    const rows = this.store.db.prepare("SELECT * FROM artifacts WHERE kind='attachment' AND conv_id=?").all(convId) as Row[];
+    if (!rows.length) return;
+    this.keepOutOfGit(cwd);
+    for (const r of rows) {
+      const to = join(cwd, ATTACH_DIR, r.id, r.name);
+      if (existsSync(to) || !existsSync(r.path)) continue;
+      mkdirSync(dirname(to), { recursive: true });
+      copyFileSync(r.path, to);
+    }
+  }
+
+  // Same file, new place: it keeps its record, including who made it. A row already listing that path is what the merge replaced.
+  worktreeMerged(fromRoot: string, toRoot: string) {
+    const db = this.store.db;
+    for (const r of db.prepare("SELECT id, path FROM artifacts WHERE root=? AND kind='file'").all(fromRoot) as Row[]) {
+      const path = join(toRoot, relative(fromRoot, r.path));
+      let st;
+      try {
+        st = lstatSync(path);
+      } catch {
+        db.prepare("UPDATE artifacts SET fate='discarded', updated_at=? WHERE id=?").run(Date.now(), r.id);
+        continue;
+      }
+      db.prepare("DELETE FROM artifacts WHERE path=? AND id!=?").run(path, r.id);
+      db.prepare("UPDATE artifacts SET path=?, root=?, size=?, mtime=?, updated_at=? WHERE id=?").run(path, toRoot, st.size, st.mtimeMs, Date.now(), r.id);
+    }
+  }
+
+  worktreeDiscarded(fromRoot: string) {
+    this.store.db.prepare("UPDATE artifacts SET fate='discarded', updated_at=? WHERE root=? AND kind='file'").run(Date.now(), fromRoot);
+  }
+
   // Otherwise an attachment would be reported as something the Bot changed. This file is local to the clone and is never committed.
   private keepOutOfGit(cwd: string) {
     try {
@@ -106,7 +141,7 @@ export class Artifacts {
       this.store.db
         .prepare(
           `INSERT INTO artifacts (id,kind,path,root,name,project_cwd,conv_id,item_id,origin,change,size,mtime,created_at,updated_at) VALUES (?,'file',?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(path) DO UPDATE SET conv_id=excluded.conv_id, item_id=excluded.item_id, origin=excluded.origin, change=excluded.change, size=excluded.size, mtime=excluded.mtime, updated_at=excluded.updated_at`,
+           ON CONFLICT(path) DO UPDATE SET fate=NULL, conv_id=excluded.conv_id, item_id=excluded.item_id, origin=excluded.origin, change=excluded.change, size=excluded.size, mtime=excluded.mtime, updated_at=excluded.updated_at`,
         )
         .run(randomUUID().slice(0, 12), r.path, r.root, basename(r.path), r.cwd, r.convId, r.itemId, r.origin, r.change, st.size, st.mtimeMs, now, now);
     }
@@ -127,14 +162,17 @@ export class Artifacts {
       .prepare(`SELECT a.*, c.title conv_title, c.bot_id, c.group_id FROM artifacts a LEFT JOIN conversations c ON c.id=a.conv_id WHERE ${where.join(" AND ")} ORDER BY a.updated_at DESC LIMIT 300`)
       .all(...args) as Row[];
     return rows.map((r) => {
-      let state = "gone";
+      let state = r.fate === "discarded" ? "discarded" : "gone";
       let bytes = r.size as number;
-      try {
-        const st = lstatSync(r.path);
-        bytes = st.size;
-        state = st.size === r.size && st.mtimeMs === r.mtime ? "same" : "changed";
-      } catch {}
-      return { id: r.id, kind: r.kind, name: r.name, rel: relative(r.root, r.path), origin: r.origin, change: r.change, size: bytes, state, preview: state === "gone" ? "none" : this.previewKind(r.name, bytes), at: r.updated_at, conv_id: r.conv_id, conv_title: r.conv_title, item_id: r.item_id, bot_id: r.bot_id, group_id: r.group_id };
+      if (state === "gone") {
+        try {
+          const st = lstatSync(r.path);
+          bytes = st.size;
+          state = st.size === r.size && st.mtimeMs === r.mtime ? "same" : "changed";
+        } catch {}
+      }
+      const gone = state === "gone" || state === "discarded";
+      return { id: r.id, kind: r.kind, name: r.name, rel: relative(r.root, r.path), origin: r.origin, change: r.change, size: bytes, state, preview: gone ? "none" : this.previewKind(r.name, bytes), at: r.updated_at, conv_id: r.conv_id, conv_title: r.conv_title, item_id: r.item_id, bot_id: r.bot_id, group_id: r.group_id };
     });
   }
 
@@ -142,6 +180,7 @@ export class Artifacts {
   private locate(id: string) {
     const r = this.store.db.prepare("SELECT * FROM artifacts WHERE id=?").get(id) as Row | undefined;
     if (!r) throw new HttpError(404, "没有这个文件");
+    if (r.fate === "discarded") throw new HttpError(410, "这个文件已随工作树丢弃");
     let st;
     try {
       st = lstatSync(r.path);

@@ -574,7 +574,7 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
         // An agent may still be writing in it.
         if (engine.conversationRunning(wt.root_conv_id)) throw new HttpError(409, "这个对话还在进行中，请等它结束");
         if (engine.research.jobRunningIn(wt.path)) throw new HttpError(409, "这个工作树里还有实验在运行");
-        await (parts[3] === "merge" ? engine.worktrees.merge(wt.id) : engine.worktrees.discard(wt.id));
+        await engine.closeWorktree(wt.id, parts[3]);
         broadcast({ type: "worktrees", convId: wt.root_conv_id });
         return json(res, 200, { ok: true });
       }
