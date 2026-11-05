@@ -6,6 +6,7 @@ import type { Worktree } from "./git.ts";
 import type { Bot, Conversation, Effort, Group, Item, PermissionPreset, Route, AgentKind } from "./types.ts";
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, cwd TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS bots (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, agent TEXT NOT NULL, model TEXT NOT NULL,
   effort TEXT NOT NULL, permission TEXT NOT NULL, route TEXT NOT NULL, cwd TEXT NOT NULL,
@@ -63,7 +64,6 @@ export const SETTING_DEFAULTS = {
   default_agent: "claude",
   default_effort: "medium",
   default_permission: "ask",
-  default_budget_bot: 150000,
   default_budget_group: 300000,
   idle_minutes: 10,
   max_depth: 3,
@@ -146,7 +146,7 @@ export class Store {
     try {
       // Claude Code files its sessions under the directory they started in, so these cannot resume from the new one.
       this.db.prepare("UPDATE conversations SET session_id=NULL WHERE agent='claude' AND (cwd=? OR substr(cwd,1,?)=?)").run(old, old.length + 1, `${old}/`);
-      const targets: [string, string][] = [["bots", "cwd"], ["conversations", "cwd"], ["groups", "cwd"], ["worktrees", "path"], ["experiments", "cwd"], ["jobs", "dir"], ["artifacts", "path"], ["artifacts", "root"], ["artifacts", "project_cwd"]];
+      const targets: [string, string][] = [["bots", "cwd"], ["conversations", "cwd"], ["groups", "cwd"], ["worktrees", "path"], ["experiments", "cwd"], ["jobs", "dir"], ["artifacts", "path"], ["artifacts", "root"], ["artifacts", "project_cwd"], ["workspaces", "cwd"]];
       for (const [t, c] of targets) {
         if (!hasTable(t)) continue;
         this.db.prepare(`UPDATE ${t} SET ${c} = ? || substr(${c}, ?) WHERE ${c} = ? OR substr(${c}, 1, ?) = ?`).run(this.home, old.length + 1, old, old.length + 1, `${old}/`);
@@ -168,6 +168,8 @@ export class Store {
 
   private migrate() {
     const has = (t: string, c: string) => (this.db.prepare(`PRAGMA table_info(${t})`).all() as Row[]).some((r) => r.name === c);
+    if (!has("bots", "workspace_id")) this.db.exec("ALTER TABLE bots ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default'");
+    if (!has("groups", "workspace_id")) this.db.exec("ALTER TABLE groups ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default'");
     if (!has("bots", "budget_tokens")) this.db.exec("ALTER TABLE bots ADD COLUMN budget_tokens INTEGER NOT NULL DEFAULT 150000");
     if (!has("bots", "can_call")) this.db.exec("ALTER TABLE bots ADD COLUMN can_call TEXT");
     if (!has("bots", "is_chief")) this.db.exec("ALTER TABLE bots ADD COLUMN is_chief INTEGER NOT NULL DEFAULT 0");
@@ -209,13 +211,18 @@ export class Store {
     return this.db.prepare("SELECT * FROM bots WHERE id=? AND archived=0").get(id) as unknown as Bot | undefined;
   }
 
-  createBot(input: { name: string; role: string; agent: AgentKind; model: string; effort: Effort; permission: PermissionPreset; route: Route; cwd?: string; budget_tokens?: number; can_call?: string | null; is_chief?: number }): Bot {
+  workspaceCwd(id: string | undefined) {
+    return id && id !== "default" ? ((this.db.prepare("SELECT cwd FROM workspaces WHERE id=?").get(id) as Row | undefined)?.cwd as string | undefined) : undefined;
+  }
+
+  createBot(input: { workspace_id?: string; name: string; role: string; agent: AgentKind; model: string; effort: Effort; permission: PermissionPreset; route: Route; cwd?: string; budget_tokens?: number; can_call?: string | null; is_chief?: number }): Bot {
     const id = randomUUID();
     const now = Date.now();
-    const cwd = input.cwd || this.defaultCwd(id);
+    const cwd = input.cwd || this.workspaceCwd(input.workspace_id) || this.defaultCwd(id);
     this.db
       .prepare("INSERT INTO bots (id,name,role,agent,model,effort,permission,route,cwd,budget_tokens,can_call,is_chief,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-      .run(id, input.name, input.role, input.agent, input.model, input.effort, input.permission, input.route, cwd, input.budget_tokens ?? this.settings().default_budget_bot, input.can_call ?? null, input.is_chief ?? 0, now, now);
+      .run(id, input.name, input.role, input.agent, input.model, input.effort, input.permission, input.route, cwd, input.budget_tokens ?? 0, input.can_call ?? null, input.is_chief ?? 0, now, now);
+    if (input.workspace_id && input.workspace_id !== "default") this.db.prepare("UPDATE bots SET workspace_id=? WHERE id=?").run(input.workspace_id, id);
     return this.getBot(id)!;
   }
 
@@ -259,7 +266,7 @@ export class Store {
   }
 
   chief(): Bot | undefined {
-    return this.db.prepare("SELECT * FROM bots WHERE is_chief=1 AND archived=0").get() as unknown as Bot | undefined;
+    return this.db.prepare("SELECT * FROM bots WHERE is_chief=1 AND archived=0 AND workspace_id='default'").get() as unknown as Bot | undefined;
   }
 
   addWorktree(w: { id: string; rootConvId: string; repoRoot: string; baseBranch: string; baseCommit: string; branch: string; path: string; botName: string }): Worktree {
@@ -307,12 +314,13 @@ export class Store {
     botIds.forEach((b, i) => this.db.prepare("INSERT INTO group_members (group_id,bot_id,position) VALUES (?,?,?)").run(groupId, b, i));
   }
 
-  createGroup(input: { name: string; cwd?: string; budget_tokens?: number; members: string[] }): Group {
+  createGroup(input: { workspace_id?: string; name: string; cwd?: string; budget_tokens?: number; members: string[] }): Group {
     const id = randomUUID();
     const now = Date.now();
-    const cwd = input.cwd || this.defaultCwd(`group-${id}`);
+    const cwd = input.cwd || this.workspaceCwd(input.workspace_id) || this.defaultCwd(`group-${id}`);
     this.db.prepare("INSERT INTO groups (id,name,cwd,budget_tokens,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id, input.name, cwd, input.budget_tokens ?? this.settings().default_budget_group, now, now);
     this.setGroupMembers(id, input.members);
+    if (input.workspace_id && input.workspace_id !== "default") this.db.prepare("UPDATE groups SET workspace_id=? WHERE id=?").run(input.workspace_id, id);
     return this.getGroup(id)!;
   }
 
@@ -401,6 +409,23 @@ export class Store {
   listTasks(convId: string | null, limit: number) {
     const where = convId ? "AND c.root_conv_id=?" : "";
     return this.db.prepare(`SELECT c.*, v.title conv_title, v.kind conv_kind, v.bot_id conv_bot_id, v.group_id conv_group_id FROM calls c JOIN conversations v ON v.id=c.root_conv_id WHERE c.mode='task' AND v.archived=0 ${where} ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?`).all(...(convId ? [convId, limit] : [limit])) as Row[];
+  }
+
+  // A call runs in a session of its own, which is what ties it to the Bot that did the work.
+  callsTo(botId: string, limit = 100) {
+    return this.db
+      .prepare(
+        `SELECT k.id, k.from_bot, k.mode, k.question, k.answer, k.status, k.reason, k.tokens, k.created_at, k.child_conv_id, k.root_conv_id,
+                r.title root_title, r.bot_id root_bot_id, r.group_id root_group_id, r.archived root_archived,
+                (SELECT i.id FROM items i WHERE i.conv_id=k.root_conv_id AND i.type='call' AND json_extract(i.data, '$.callId')=k.id LIMIT 1) item_id
+         FROM calls k JOIN conversations c ON c.id=k.child_conv_id LEFT JOIN conversations r ON r.id=k.root_conv_id
+         WHERE c.bot_id=? ORDER BY k.created_at DESC, k.rowid DESC LIMIT ?`,
+      )
+      .all(botId, limit) as Row[];
+  }
+
+  callCountTo(botId: string) {
+    return Number((this.db.prepare("SELECT COUNT(*) n FROM calls k JOIN conversations c ON c.id=k.child_conv_id WHERE c.bot_id=?").get(botId) as Row).n);
   }
 
   listCalls(rootTurnId: string) {
@@ -505,8 +530,8 @@ export const CHIEF_ROLE = `${CHIEF_ROLE_HEAD}
 
 const ENGINEER_V1 = "你是团队的工程师 Engineer，负责实现分割模型相关代码。先读懂现有代码再动手，改动要小，并说明如何验证。";
 const REVIEWER_V1 = "你是团队的审查员 Reviewer，负责审查代码。重点检查损失函数、指标、数据加载和后处理，只报告有依据的问题。";
-const ENGINEER_ROLE = "你是团队的工程师 Engineer，负责写代码和改代码。先读懂现有代码再动手，改动要小，并说明如何验证。";
-const REVIEWER_ROLE = "你是团队的审查员 Reviewer，负责审查别人的成果。重点找会出错的地方，只报告有依据的问题。";
+export const ENGINEER_ROLE = "你是团队的工程师 Engineer，负责写代码和改代码。先读懂现有代码再动手，改动要小，并说明如何验证。";
+export const REVIEWER_ROLE = "你是团队的审查员 Reviewer，负责审查别人的成果。重点找会出错的地方，只报告有依据的问题。";
 
 // The first seeds were written for one kind of project. Text the user has edited is left alone.
 function upgradeSeedRoles(store: Store) {
@@ -525,7 +550,7 @@ export function ensureChief(store: Store) {
 export function ensureSeedBots(store: Store) {
   ensureChief(store);
   upgradeSeedRoles(store);
-  if (store.listBots().length > 1) return;
+  if (store.listBots().filter((b) => b.workspace_id === "default").length > 1) return;
   store.createBot({
     name: "Engineer",
     role: ENGINEER_ROLE,

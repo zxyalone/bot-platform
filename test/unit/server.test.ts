@@ -115,11 +115,12 @@ test("the default theme is dark, and an empty model is refused", async () => {
 
 test("new-Bot defaults come from settings, and explicit values still win", async () => {
   const t = await boot(() => noop);
-  await t.api("PUT", "/api/settings", { default_effort: "low", default_permission: "read_only", default_budget_bot: 5000, default_budget_group: 7000 });
+  await t.api("PUT", "/api/settings", { default_effort: "low", default_permission: "read_only", default_budget_group: 7000 });
+  assert.equal((await t.api("PUT", "/api/settings", { default_budget_bot: 5000 })).status, 400, "a Bot no longer has a per-round budget to default");
   const a = (await t.api("POST", "/api/bots", { name: "a", agent: "codex" })).body;
-  assert.deepEqual([a.effort, a.permission, a.budget_tokens], ["low", "read_only", 5000]);
+  assert.deepEqual([a.effort, a.permission, a.budget_tokens], ["low", "read_only", 0]);
   const b = (await t.api("POST", "/api/bots", { name: "b", agent: "codex", effort: "high", permission: "ask", budget_tokens: 9000 })).body;
-  assert.deepEqual([b.effort, b.permission, b.budget_tokens], ["high", "ask", 9000]);
+  assert.deepEqual([b.effort, b.permission, b.budget_tokens], ["high", "ask", 0], "and asking for one has no effect");
   assert.equal((await t.api("POST", "/api/groups", { name: "g", members: [a.id, b.id] })).body.budget_tokens, 7000);
   t.close();
 });

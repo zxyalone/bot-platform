@@ -306,7 +306,7 @@ test("a task that can be retried says where, whether earlier work stays, and wha
   await s.idle(conv);
   info = (await s.task(one.task_id)).retry_info;
   assert.equal(info.new_round, true);
-  assert.ok(info.budget > 0);
+  assert.equal(info.budget, 0, "a conversation with one Bot has no per-round limit");
   assert.equal(info.worktree, null);
   await s.end();
 });

@@ -206,8 +206,9 @@ test("an approval from a called Bot appears in the user's conversation and reach
   s.t.close();
 });
 
-test("running over budget stops the whole chain, reports it, and refuses new calls", async () => {
-  const s = await setup(["A", "B"], { budget_tokens: 1000 });
+test("running over the project's budget stops the whole chain, reports it, and refuses new calls", async () => {
+  const s = await setup(["A", "B"]);
+  await s.t.api("PUT", `/api/projects/${s.bots.A.project_memory}/settings`, { budget_total: 1000 });
   const convId = await s.say("A");
   const a = await s.waitRt("A");
   const pending = s.bus(a, "ask_bot", { bot: "B", question: "x" });

@@ -191,7 +191,7 @@ test("a proposal changes nothing until approved, then creates the Bot", async ()
   await c.t.api("POST", `/api/approvals/${card.id}`, { decision: "allow" });
   assert.match((await pending).text, /已创建/);
   const bot = (await c.t.api("GET", "/api/state")).body.bots.find((b: any) => b.name === "Scholar");
-  assert.deepEqual([bot.permission, bot.budget_tokens], ["read_only", 50000]);
+  assert.deepEqual([bot.permission, bot.budget_tokens], ["read_only", 0], "a Bot no longer has a budget of its own");
   c.t.close();
 });
 
@@ -211,7 +211,7 @@ test("the user can deny a proposal or change it before approving", async () => {
   await c.t.api("POST", `/api/approvals/${card.id}`, { decision: "allow", spec: { ...spec, name: "Scholar2", budget_tokens: 2000, cwd: "/etc" } });
   await pending;
   const bot = (await c.t.api("GET", "/api/state")).body.bots.find((b: any) => b.name === "Scholar2");
-  assert.equal(bot.budget_tokens, 2000);
+  assert.equal(bot.budget_tokens, 0);
   assert.notEqual(bot.cwd, "/etc", "a proposal cannot set a working directory");
   c.t.close();
 });

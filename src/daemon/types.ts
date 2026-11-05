@@ -7,6 +7,7 @@ export type TurnStatus = "completed" | "interrupted" | "failed";
 
 export interface Bot {
   id: string;
+  workspace_id: string;
   name: string;
   role: string;
   agent: AgentKind;
@@ -26,6 +27,7 @@ export interface Bot {
 
 export interface Group {
   id: string;
+  workspace_id: string;
   name: string;
   cwd: string;
   budget_tokens: number;

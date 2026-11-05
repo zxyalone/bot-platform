@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { summarize } from "./research.ts";
 import { search } from "./search.ts";
+import { createWorkspace, listWorkspaces, WORKSPACE_TEMPLATES } from "./workspaces.ts";
 import { MAX_UPLOAD } from "./artifacts.ts";
 import type { Pack } from "./exporter.ts";
 import { createReadStream, rmSync } from "node:fs";
@@ -32,6 +33,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/search.js": { file: "search.js", type: "text/javascript; charset=utf-8" },
   "/artifacts.js": { file: "artifacts.js", type: "text/javascript; charset=utf-8" },
   "/project.js": { file: "project.js", type: "text/javascript; charset=utf-8" },
+  "/calls.js": { file: "calls.js", type: "text/javascript; charset=utf-8" },
   "/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" },
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -72,7 +74,6 @@ const SETTING_RULES: Record<string, string[] | [number, number] | "boolean"> = {
   default_agent: Object.keys(MODELS),
   default_effort: ["low", "medium", "high"],
   default_permission: ["ask", "auto_edit", "read_only"],
-  default_budget_bot: [1000, 50_000_000],
   default_budget_group: [1000, 50_000_000],
   idle_minutes: [1, 1440],
   max_depth: [1, 10],
@@ -129,7 +130,6 @@ async function validateBot(input: any, existing?: Bot, defaults: AppSettings = S
     const s = await stat(out.cwd).catch(() => null);
     if (!s?.isDirectory()) throw new HttpError(400, "工作目录不存在");
   }
-  if (input.budget_tokens !== undefined) out.budget_tokens = validBudget(input.budget_tokens);
   if (input.can_call !== undefined) {
     if (input.can_call !== null && (!Array.isArray(input.can_call) || input.can_call.some((x: unknown) => typeof x !== "string"))) throw new HttpError(400, "can_call 无效");
     out.can_call = input.can_call === null ? null : JSON.stringify(input.can_call);
@@ -243,7 +243,7 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
   let quotaCache: { at: number; value: Promise<QuotaReport> } | null = null;
   const refine = o.refine ?? refineRole;
 
-  const botView = (b: Bot) => ({ ...b, research_enabled: Boolean(engine.research.settings(Memory.projectId(b.cwd)).enabled), can_call: b.can_call ? JSON.parse(b.can_call) : null, usage: o.store.botUsage(b.id), conversations: o.store.listConversations(b.id), project_memory: Memory.projectId(b.cwd) });
+  const botView = (b: Bot) => ({ ...b, call_count: o.store.callCountTo(b.id), research_enabled: Boolean(engine.research.settings(Memory.projectId(b.cwd)).enabled), can_call: b.can_call ? JSON.parse(b.can_call) : null, usage: o.store.botUsage(b.id), conversations: o.store.listConversations(b.id), project_memory: Memory.projectId(b.cwd) });
   const groupView = (g: Group) => ({ ...g, research_enabled: Boolean(engine.research.settings(Memory.projectId(g.cwd)).enabled), members: o.store.groupMembers(g.id).map((m) => m.id), conversations: o.store.listGroupConversations(g.id), project_memory: Memory.projectId(g.cwd) });
 
   const validateGroup = async (input: any, existing?: Group) => {
@@ -266,6 +266,13 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
     }
     if (!existing && (!out.name || !out.members)) throw new HttpError(400, "请填写群聊名称并选择成员");
     return out;
+  };
+
+  const workspaceOf = (input: any): string => {
+    const id = input?.workspace_id;
+    if (id === undefined || id === "default") return "default";
+    if (typeof id !== "string" || !o.store.workspaceCwd(id)) throw new HttpError(400, "没有这个工作空间");
+    return id;
   };
 
   const route = async (req: IncomingMessage, res: ServerResponse) => {
@@ -296,7 +303,7 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
     }
     if (parts[0] !== "api") throw new HttpError(404, "Not found");
 
-    if (m === "GET" && pathname === "/api/state") return json(res, 200, { steerable: STEERABLE, settings: o.store.settings(), bots: o.store.listBots().map(botView), groups: o.store.listGroups().map(groupView), agents: await status(), chief_default_role: CHIEF_ROLE });
+    if (m === "GET" && pathname === "/api/state") return json(res, 200, { workspaces: listWorkspaces(o.store), workspace_templates: WORKSPACE_TEMPLATES.map(({ role: _role, ...t }) => t), steerable: STEERABLE, settings: o.store.settings(), bots: o.store.listBots().map(botView), groups: o.store.listGroups().map(groupView), agents: await status(), chief_default_role: CHIEF_ROLE });
     if (pathname === "/api/settings") {
       if (m === "GET") return json(res, 200, { settings: o.store.settings(), home: o.store.home });
       if (m === "PUT") {
@@ -319,8 +326,17 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
       if (!draft.trim() && !name.trim()) throw new HttpError(400, "先写一点职责，或至少填上名称");
       return json(res, 200, { role: await refine({ name, draft, chief: Boolean(body.chief) }) });
     }
+    if (m === "POST" && pathname === "/api/workspaces") {
+      const made = await createWorkspace(o.store, engine.projects, await readJson(req));
+      broadcast({ type: "bots_changed" });
+      return json(res, 201, { ...made, bots: made.bots.map(botView) });
+    }
     if (m === "POST" && pathname === "/api/groups") {
-      const g = o.store.createGroup(await validateGroup(await readJson(req)));
+      const input = await readJson(req);
+      const workspace = workspaceOf(input);
+      const spec = await validateGroup(input);
+      for (const id of spec.members) if (o.store.getBot(id)?.workspace_id !== workspace) throw new HttpError(400, "群聊成员要在同一个工作空间");
+      const g = o.store.createGroup({ ...spec, workspace_id: workspace });
       broadcast({ type: "group", group: groupView(g) });
       return json(res, 201, groupView(g));
     }
@@ -353,8 +369,36 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
         return json(res, 200, { ok: true });
       }
     }
+    if (m === "GET" && parts[1] === "bots" && parts[3] === "calls") {
+      if (!o.store.getBot(parts[2])) throw new HttpError(404, "Bot 不存在");
+      const first = (s: unknown) => String(s ?? "").trim().split("\n")[0].slice(0, 80);
+      return json(res, 200, {
+        calls: o.store.callsTo(parts[2]).map((c) => ({
+          id: c.id,
+          from: c.from_bot,
+          mode: c.mode,
+          title: first(c.question),
+          question: c.question,
+          answer: c.answer,
+          status: c.status,
+          tokens: c.tokens,
+          at: c.created_at,
+          child_conv_id: c.child_conv_id,
+          conv_id: c.root_conv_id,
+          bot_id: c.root_bot_id,
+          group_id: c.root_group_id,
+          root_title: c.root_title,
+          root_open: !c.root_archived && Boolean(c.root_title),
+          item_id: c.item_id,
+        })),
+      });
+    }
     if (m === "POST" && pathname === "/api/bots") {
-      const bot = o.store.createBot(await checkBot(await readJson(req)));
+      const input = await readJson(req);
+      const workspace = workspaceOf(input);
+      const spec = await checkBot(input);
+      if (o.store.listBots().some((b) => b.workspace_id === workspace && b.name.toLowerCase() === String(spec.name).toLowerCase())) throw new HttpError(409, `这个工作空间已经有叫 ${spec.name} 的 Bot`);
+      const bot = o.store.createBot({ ...spec, workspace_id: workspace });
       broadcast({ type: "bot", bot: botView(bot) });
       return json(res, 201, botView(bot));
     }

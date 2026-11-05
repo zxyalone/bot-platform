@@ -51,7 +51,7 @@ export function mountTasks(root, ctx) {
     await refresh();
   }
 
-  const retryText = (i) => [`在 ${i.cwd}${i.worktree ? `（工作树 ${i.worktree}）` : ""} 继续，上次留下的改动不会还原`, i.resumes_session ? "接着对方原来的 agent 会话" : "对方从新会话开始", i.new_round ? `这一轮已结束，会新开一轮，最多再用 ${i.budget ?? "每轮预算的"} tokens` : "计入还在进行的这一轮的预算和调用次数"].join("；");
+  const retryText = (i) => [`在 ${i.cwd}${i.worktree ? `（工作树 ${i.worktree}）` : ""} 继续，上次留下的改动不会还原`, i.resumes_session ? "接着对方原来的 agent 会话" : "对方从新会话开始", i.new_round ? (i.budget ? `这一轮已结束，会新开一轮，最多再用 ${i.budget} tokens` : "这一轮已结束，会新开一轮，没有每轮上限，只受项目预算限制") : "计入还在进行的这一轮的预算和调用次数"].join("；");
 
   function card(t) {
     const line = (label, text, cls = "") => h("div", { class: "task-line" }, h("span", { class: "task-label" }, label), h("span", { class: cls }, text));
@@ -73,7 +73,7 @@ export function mountTasks(root, ctx) {
         h("span", { class: "spacer" }),
         t.tokens ? h("span", { class: "muted small" }, `${t.tokens} tokens`) : null,
         t.can_cancel ? h("button", { type: "button", class: "danger", disabled: ui.busy.has(t.id) ? true : null, onclick: () => cancel(t) }, "取消") : null,
-        t.can_retry ? h("button", { type: "button", disabled: ui.busy.has(t.id) ? true : null, title: "如果这一轮已经结束，会新开一轮，占用一份每轮预算；调用次数、深度、并发和审批照常生效", onclick: () => retry(t) }, "重试") : null,
+        t.can_retry ? h("button", { type: "button", disabled: ui.busy.has(t.id) ? true : null, title: "如果这一轮已经结束，会新开一轮；调用次数、深度、并发和审批照常生效", onclick: () => retry(t) }, "重试") : null,
       ),
     );
   }

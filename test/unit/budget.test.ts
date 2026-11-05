@@ -360,3 +360,25 @@ test("a stopped turn that reports zero usage keeps what was already spent; a rea
   assert.equal((await s.report()).total.spent, 600, "the estimate settles to the exact figure");
   await s.end();
 });
+
+test("a conversation with one Bot has no per-round limit; a group still does", async () => {
+  const s = await setup();
+  const id = (await s.say("A")).body.id as string;
+  const f = await s.waitRt("A");
+  f.spend(50_000_000);
+  const d = await s.data(id);
+  assert.equal(d.conversation.status, "running", "only a project budget could stop this");
+  assert.equal(d.items.filter((i: any) => i.type === "error").length, 0);
+  const trace = (await s.t.api("GET", `/api/conversations/${id}/trace`)).body;
+  assert.deepEqual([trace.budget.limit, trace.budget.spent], [0, 50_000_000]);
+  f.reply();
+  await s.idle(id);
+
+  const g = (await s.t.api("POST", "/api/groups", { name: "g", members: [s.bots.B.id, s.bots.C.id], cwd: s.cwd, budget_tokens: 1000 })).body;
+  const conv = (await s.t.api("POST", `/api/groups/${g.id}/messages`, { text: "@B 做" })).body.id as string;
+  const b = await s.waitRt("B");
+  b.spend(1200);
+  await s.idle(conv);
+  assert.match((await s.data(conv)).items.find((i: any) => i.type === "error").data.message, /达到预算 1000/);
+  await s.end();
+});

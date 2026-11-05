@@ -22,6 +22,8 @@ export { HttpError };
 const MAX_BOTS = 12;
 export const STEERABLE: AgentKind[] = ["claude", "codex"];
 const MAX_QUEUED = 10;
+// A conversation with one Bot has no per-round limit. Only the project's budget, if one is set, can stop it. Groups still have one.
+const NO_ROUND_LIMIT = 0;
 const MAX_COMPARED = 6;
 const MAX_PLAN_STEPS = 12;
 const COMPARE_ANSWER = 12000;
@@ -37,7 +39,7 @@ const MAX_PREVIEW_FILE = 1024 * 1024;
 const CANCEL_NOTE = "你取消了这个任务";
 // What a person would accept as "it was checked". A match says only that the command ran and how it exited.
 const CHECK_COMMAND = /(^|[\s;&|/])(pytest|tox|ctest|vitest|jest|mypy|ruff|eslint|tsc|unittest|(npm|pnpm|yarn)( run)? (test|lint|check)\S*|node --test|cargo (test|check|clippy)|go (test|vet)|(mvn|gradle) test|make (test|check))(\s|$)/;
-const PROPOSAL_FIELDS = ["name", "role", "agent", "model", "effort", "permission", "budget_tokens"];
+const PROPOSAL_FIELDS = ["name", "role", "agent", "model", "effort", "permission"];
 const PERMISSION_TEXT: Record<string, string> = { ask: "每次询问", auto_edit: "自动改文件（工作目录）", read_only: "只读" };
 const pick = (o: any) => Object.fromEntries(PROPOSAL_FIELDS.filter((k) => o?.[k] !== undefined).map((k) => [k, o[k]]));
 
@@ -318,6 +320,16 @@ export class Engine {
     this.broadcastBudget(root, true);
     this.touch(root);
     return root;
+  }
+
+  // The page shows how often a Bot has been called, and nothing else about a call changes the Bot.
+  private noteCall(botId: string) {
+    this.publish({ type: "bot_calls", botId, count: this.store.callCountTo(botId) });
+  }
+
+  // Bots know each other by name, and names are only unique within a workspace.
+  private peers(bot: { workspace_id: string }) {
+    return this.store.listBots().filter((b) => b.workspace_id === bot.workspace_id);
   }
 
   // ---------- across the whole project ----------
@@ -861,7 +873,7 @@ export class Engine {
     const prompt = this.withNotices(conv.id, text);
     const request = this.addItem(conv.id, null, "user", "done", { text, ...(files.list.length ? { attachments: files.list } : {}) });
     this.setConversation(conv.id, { status: "running" });
-    const root = this.openRoot(conv.id, bot.budget_tokens);
+    const root = this.openRoot(conv.id, NO_ROUND_LIMIT);
     root.requestItem = request.id;
     void this.runTurn(bot, conv.id, prompt, { root, displayConvId: conv.id, depth: 0, chain: [bot.id], callId: null, callPath: [], speaker: null }).finally(() => this.closeRoot(root));
     return this.store.getConversation(conv.id)!;
@@ -949,6 +961,7 @@ export class Engine {
       const callId = randomUUID();
       this.store.addCall({ id: callId, rootTurnId: root.id, rootConvId: conv.id, callerConvId: conv.id, childConvId: child.id, parentCallId: null, from: "你", to: bot.name, mode: "compare", depth: 1, question, status: "waiting", chain, timeoutMs: this.taskTimeout(NaN) });
       root.callCount++;
+      this.noteCall(bot.id);
       const target = { ...bot, permission: "read_only" as const };
       const task = this.launchTask({ callId, itemId: "", callerName: "你", ctx, target, child, question, worktree: null, prompt }, [], this.taskTimeout(NaN), true);
       return task.done.then(() => {
@@ -1345,7 +1358,7 @@ export class Engine {
     switch (tool) {
       case "list_bots": {
         const allowed = canCallList(l.bot);
-        const bots = this.store.listBots().filter((b) => b.id !== l.bot.id && (!allowed || allowed.includes(b.id)));
+        const bots = this.peers(l.bot).filter((b) => b.id !== l.bot.id && (!allowed || allowed.includes(b.id)));
         return { text: bots.map((b) => `- ${b.name}：${b.role.slice(0, 160) || "（未写职责）"}`).join("\n") || "没有可调用的 Bot", isError: false };
       }
       case "ask_bot":
@@ -1435,7 +1448,7 @@ export class Engine {
     }));
     const ids = new Set(steps.map((s) => s.id));
     if (ids.size !== steps.length) throw new HttpError(400, "步骤的 id 不能重复");
-    const bots = this.store.listBots();
+    const bots = this.peers(caller);
     // Numbers, because the person's card shows numbers and a step they added has only a generated id.
     const name = (id: string) => `第 ${steps.findIndex((x) => x.id === id) + 1} 步`;
     for (const s of steps) {
@@ -1497,7 +1510,7 @@ export class Engine {
 
   // Chief can only propose: nothing changes until the user approves the card.
   private async manageBot(l: Live, ctx: TurnCtx, tool: string, args: any): Promise<CallResult> {
-    const existing = tool === "create_bot" ? undefined : this.store.listBots().find((b) => b.name.toLowerCase() === String(args?.bot ?? "").trim().toLowerCase());
+    const existing = tool === "create_bot" ? undefined : this.peers(l.bot).find((b) => b.name.toLowerCase() === String(args?.bot ?? "").trim().toLowerCase());
     if (tool !== "create_bot" && !existing) return { text: `没有叫 ${String(args?.bot)} 的 Bot`, isError: true };
     if (existing?.is_chief) return { text: "Chief 不能修改或暂停自己", isError: true };
     if (tool === "pause_bot") {
@@ -1506,11 +1519,11 @@ export class Engine {
       this.broadcast({ type: "bots_changed" });
       return { text: `已暂停 ${existing!.name}`, isError: false };
     }
-    if (tool === "create_bot" && this.store.listBots().length >= MAX_BOTS) return { text: `Bot 数量已达上限 ${MAX_BOTS}`, isError: true };
+    if (tool === "create_bot" && this.peers(l.bot).length >= MAX_BOTS) return { text: `Bot 数量已达上限 ${MAX_BOTS}`, isError: true };
     const spec = pick(args);
     if (!existing && !spec.model) return { text: "新建 Bot 必须指定 model", isError: true };
     if (spec.model && !MODELS[(spec.agent ?? existing?.agent) as AgentKind]?.includes(spec.model)) return { text: `模型 ${spec.model} 不属于这个 agent`, isError: true };
-    if (spec.name && this.store.listBots().some((b) => b.id !== existing?.id && b.name.toLowerCase() === String(spec.name).trim().toLowerCase())) return { text: `已经有叫 ${spec.name} 的 Bot`, isError: true };
+    if (spec.name && this.peers(l.bot).some((b) => b.id !== existing?.id && b.name.toLowerCase() === String(spec.name).trim().toLowerCase())) return { text: `已经有叫 ${spec.name} 的 Bot`, isError: true };
     try {
       await this.validateBot(spec, existing);
     } catch (e) {
@@ -1518,12 +1531,12 @@ export class Engine {
     }
     const title = existing ? `修改 Bot：${existing.name}` : `新建 Bot：${spec.name}`;
     const shown = { ...existing && pick(existing), ...spec };
-    const detail = [`名称：${shown.name}`, `底层：${shown.agent} · ${shown.model}`, `强度：${shown.effort ?? this.store.settings().default_effort}`, `权限：${PERMISSION_TEXT[shown.permission ?? this.store.settings().default_permission]}`, `每轮预算：${shown.budget_tokens ?? this.store.settings().default_budget_bot} tokens`, "", `职责：${shown.role ?? ""}`].join("\n");
+    const detail = [`名称：${shown.name}`, `底层：${shown.agent} · ${shown.model}`, `强度：${shown.effort ?? this.store.settings().default_effort}`, `权限：${PERMISSION_TEXT[shown.permission ?? this.store.settings().default_permission]}`, "", `职责：${shown.role ?? ""}`].join("\n");
     const answer = await this.askUser(l, ctx, { kind: "bot_proposal", title, detail, canRemember: false, from: l.bot.name, spec: shown, existingId: existing?.id });
     if (answer.decision === "expired") return { text: "提议已失效", isError: true };
     if (answer.decision === "deny") return { text: "用户拒绝了这个提议", isError: true };
     const finalSpec = answer.spec ?? spec;
-    const bot = existing ? this.store.updateBot(existing.id, await this.validateBot(finalSpec, existing))! : this.store.createBot(await this.validateBot(finalSpec));
+    const bot = existing ? this.store.updateBot(existing.id, await this.validateBot(finalSpec, existing))! : this.store.createBot({ ...(await this.validateBot(finalSpec)), workspace_id: l.bot.workspace_id });
     this.broadcast({ type: "bots_changed" });
     return { text: `已${existing ? "修改" : "创建"} Bot：${bot.name}。`, isError: false };
   }
@@ -1589,7 +1602,7 @@ export class Engine {
     const bot = conv.bot_id ? this.store.getBot(conv.bot_id) : undefined;
     if (!bot || conv.agent !== bot.agent) return;
     this.setConversation(convId, { status: "running" });
-    const root = this.openRoot(convId, bot.budget_tokens);
+    const root = this.openRoot(convId, NO_ROUND_LIMIT);
     void this.runTurn(bot, convId, prompt, { root, displayConvId: convId, depth: 0, chain: [bot.id], callId: null, callPath: [], speaker: null }).finally(() => this.closeRoot(root));
   }
 
@@ -1636,7 +1649,7 @@ export class Engine {
       return { refused: reason };
     };
     if (typeof body !== "string" || !body.trim()) return refuse("问题不能为空");
-    const target = this.store.listBots().find((b) => b.name.toLowerCase() === String(name ?? "").trim().toLowerCase());
+    const target = this.peers(l.bot).find((b) => b.name.toLowerCase() === String(name ?? "").trim().toLowerCase());
     if (!target) return refuse(`没有叫 ${String(name)} 的 Bot，请先用 list_bots 查看`);
     // Someone approved all of a plan, so a step over the concurrency limit waits for a slot rather than being refused.
     const deferred = place.dependsOn.length > 0 || place.queue === true;
@@ -1689,6 +1702,7 @@ export class Engine {
     const callId = randomUUID();
     const status = queued ? "waiting" : "running";
     this.store.addCall({ id: callId, rootTurnId: root.id, rootConvId: root.convId, callerConvId: l.convId, childConvId: child.id, parentCallId: ctx.callId, from: l.bot.name, to: target.name, mode, depth: ctx.depth + 1, question: body, status, chain: ctx.chain, dependsOn: place.dependsOn, timeoutMs: place.timeoutMs });
+    this.noteCall(target.id);
     const item = this.addItem(ctx.displayConvId, l.turnId, "call", status, { from: l.bot.name, to: target.name, toId: target.id, question: body, childConvId: child.id, mode, callId, branch: worktree?.branch });
     this.broadcast({ type: "trace", convId: root.convId });
     return { callId, itemId: item.id, target, child, worktree, queued };
@@ -1886,7 +1900,7 @@ export class Engine {
     const child = r.child_conv_id ? this.store.getConversation(r.child_conv_id as string) : undefined;
     if (!conv || !child) return null;
     const worktree = this.store.listWorktrees(conv.id).find((w) => child.cwd === w.path || child.cwd.startsWith(`${w.path}/`));
-    const budget = conv.kind === "group" ? this.store.getGroup(conv.group_id!)?.budget_tokens : conv.bot_id ? this.store.getBot(conv.bot_id)?.budget_tokens : undefined;
+    const budget = conv.kind === "group" ? this.store.getGroup(conv.group_id!)?.budget_tokens : conv.bot_id && this.store.getBot(conv.bot_id) ? NO_ROUND_LIMIT : undefined;
     return { cwd: child.cwd, worktree: worktree?.branch ?? null, keeps_changes: true, new_round: !this.roots.has(conv.id), budget: budget ?? null, resumes_session: Boolean(child.session_id) };
   }
 
@@ -1907,7 +1921,7 @@ export class Engine {
     const oldChild = row.child_conv_id ? this.store.getConversation(row.child_conv_id as string) : undefined;
     const target = oldChild?.bot_id ? this.store.getBot(oldChild.bot_id) : undefined;
     if (!oldChild || !target) throw new HttpError(409, `${row.to_bot} 已归档`);
-    const budget = conv.kind === "group" ? this.store.getGroup(conv.group_id!)?.budget_tokens : conv.bot_id ? this.store.getBot(conv.bot_id)?.budget_tokens : undefined;
+    const budget = conv.kind === "group" ? this.store.getGroup(conv.group_id!)?.budget_tokens : conv.bot_id && this.store.getBot(conv.bot_id) ? NO_ROUND_LIMIT : undefined;
     if (budget === undefined) throw new HttpError(409, "这个对话所属的 Bot 或群聊已归档");
 
     const open = this.roots.get(conv.id);
@@ -1936,6 +1950,7 @@ export class Engine {
     const timeoutMs = this.taskTimeout(Number(row.timeout_ms));
     const parent = open ? (row.parent_call_id as string | null) : null;
     this.store.addCall({ id: callId, rootTurnId: root.id, rootConvId: conv.id, callerConvId: callerConv.id, childConvId: child.id, parentCallId: parent, from: caller.name, to: target.name, mode: "task", depth: row.depth as number, question: row.question as string, status, chain, dependsOn, retryOf: id, timeoutMs });
+    this.noteCall(target.id);
     const item = this.addItem(conv.id, null, "call", status, { from: caller.name, to: target.name, toId: target.id, question: row.question, childConvId: child.id, mode: "task", callId, branch: worktree?.branch, retry: true });
     this.broadcast({ type: "trace", convId: conv.id });
     const ctx: TurnCtx = { root, displayConvId: conv.id, depth: at.depth, chain, callId: parent, callPath: parent ? this.callPath(parent) : [], speaker: null };
@@ -2133,10 +2148,10 @@ export class Engine {
 
   restoreBot(id: string) {
     const db = this.store.db;
-    const row = db.prepare("SELECT name FROM bots WHERE id=? AND archived=1").get(id) as { name: string } | undefined;
+    const row = db.prepare("SELECT name, workspace_id FROM bots WHERE id=? AND archived=1").get(id) as { name: string; workspace_id: string } | undefined;
     if (!row) throw new HttpError(404, "没有这个归档的 Bot");
-    if (this.store.listBots().length >= MAX_BOTS) throw new HttpError(409, `Bot 数量已达上限 ${MAX_BOTS}`);
-    if (this.store.listBots().some((b) => b.name.toLowerCase() === row.name.toLowerCase())) throw new HttpError(409, `已经有叫 ${row.name} 的 Bot，请先改名`);
+    if (this.peers(row).length >= MAX_BOTS) throw new HttpError(409, `Bot 数量已达上限 ${MAX_BOTS}`);
+    if (this.peers(row).some((b) => b.name.toLowerCase() === row.name.toLowerCase())) throw new HttpError(409, `已经有叫 ${row.name} 的 Bot，请先改名`);
     db.prepare("UPDATE bots SET archived=0 WHERE id=?").run(id);
     this.broadcast({ type: "bots_changed" });
     return this.store.getBot(id);

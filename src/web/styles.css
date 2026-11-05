@@ -423,6 +423,16 @@ a.button { display: inline-flex; align-items: center; padding: 4px 10px; border:
 .plan-deps { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 0.8rem; }
 .plan-list { margin: 0; padding-left: 20px; display: grid; gap: 4px; font-size: 0.85rem; }
 .plan-list p { margin: 2px 0 0; }
+.workspace-bar { display: flex; align-items: center; gap: 4px; padding: 0 10px 8px; }
+.workspace-select { flex: 1; min-width: 0; font-size: 0.84rem; }
+.workspace-team { display: grid; gap: 6px; }
+.workspace-member { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 10px; font-size: 0.84rem; }
+.workspace-member label { display: flex; align-items: center; gap: 6px; }
+.workspace-member select { max-width: 220px; font-size: 0.8rem; }
+.calls-row { display: block; margin-bottom: 8px; }
+.calls-row summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; cursor: pointer; font-size: 0.85rem; }
+.calls-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%; color: var(--muted); }
+.conv-calls { margin-left: 16px; display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.78rem; }
 .module-row { display: flex; gap: 10px; align-items: flex-start; font-size: 0.85rem; }
 .module-row > span { flex: 1; }
 .module-row button { padding: 2px 10px; font-size: 0.82rem; flex: none; }

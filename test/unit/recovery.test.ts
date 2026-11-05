@@ -120,17 +120,18 @@ test("a retry cannot go around the rules for a message: running, handled twice, 
   s.t.close();
 });
 
-test("a retry still runs under the per-round budget and still asks for approval", async () => {
+test("a retry still runs under the project's budget and still asks for approval", async () => {
   const s = await setup();
-  const low = await s.newBot("Low", s.cwd, { budget_tokens: 10000 });
+  const low = await s.newBot("Low", s.cwd);
   const { conv, error } = await s.failed("做", low);
+  await s.t.api("PUT", `/api/projects/${low.project_memory}/settings`, { budget_total: 10000 });
   assert.equal((await s.retry(error.id)).status, 202);
   const rt = await s.sentTo(/重试上一步/);
   rt.emit({ type: "approval", requestId: "r1", title: "写文件", detail: "", canRemember: false });
   await s.t.waitFor(async () => (await s.items(conv)).some((i) => i.type === "approval" && i.status === "pending"), "approval");
   assert.equal((await s.inbox())[0].kind, "approval");
   rt.emit({ type: "usage_tick", tokens: 20000 });
-  await s.t.waitFor(async () => (await s.items(conv)).some((i) => i.type === "error" && /达到预算/.test(i.data.message)), "budget stop");
+  await s.t.waitFor(async () => (await s.items(conv)).some((i) => i.type === "error" && /预算用完了/.test(i.data.message)), "budget stop");
   await s.idle(conv);
   s.t.close();
 });

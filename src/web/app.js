@@ -6,6 +6,7 @@ import { mountSettings } from "./settings.js";
 import { mountTasks, TASK_STATUS } from "./tasks.js";
 import { mountInbox } from "./inbox.js";
 import { mountSearch } from "./search.js";
+import { mountCalls } from "./calls.js";
 import { mountProject } from "./project.js";
 import { mountArtifacts, previewArtifact } from "./artifacts.js";
 import { draftKey as keyFor, loadDrafts, saveDrafts } from "./drafts.js";
@@ -98,6 +99,16 @@ async function api(path, options = {}) {
 }
 
 const currentBot = () => state.bots.find((b) => b.id === state.botId) ?? null;
+// Only this workspace's Bots and groups are shown or offered. Anything can still be jumped to, which switches over.
+const hereBots = () => state.bots.filter((b) => b.workspace_id === state.workspaceId);
+const hereGroups = () => state.groups.filter((g) => g.workspace_id === state.workspaceId);
+function enterWorkspace(id) {
+  if (!id || state.workspaceId === id) return;
+  state.workspaceId = id;
+  try {
+    window.localStorage.setItem("bot-platform:workspace", id);
+  } catch {}
+}
 const currentGroup = () => state.groups.find((g) => g.id === state.groupId) ?? null;
 const currentEntity = () => currentGroup() ?? currentBot();
 const currentConv = () => currentEntity()?.conversations.find((c) => c.id === state.convId) ?? null;
@@ -156,6 +167,7 @@ async function selectGroup(groupId, convId) {
   state.sendError = null;
   state.sidebarOpen = false;
   const g = currentGroup();
+  enterWorkspace(g?.workspace_id);
   state.convId = convId && g?.conversations.some((c) => c.id === convId) ? convId : (g?.conversations[0]?.id ?? null);
   await loadItems();
 }
@@ -168,6 +180,7 @@ async function selectBot(botId, convId) {
   state.sendError = null;
   state.sidebarOpen = false;
   const bot = currentBot();
+  enterWorkspace(bot?.workspace_id);
   state.convId = convId && bot?.conversations.some((c) => c.id === convId) ? convId : (bot?.conversations[0]?.id ?? null);
   await loadItems();
 }
@@ -258,6 +271,7 @@ let deltaFrame = 0;
 
 function handleEvent(ev) {
   if (state.view === "project" && ["item", "budget", "trace", "conversation"].includes(ev.type)) refreshProjectPage();
+  if (state.view === "calls" && ev.type === "trace") refreshCallsPage();
   switch (ev.type) {
     case "delta": {
       const item = state.items.find((i) => i.id === ev.itemId);
@@ -289,6 +303,14 @@ function handleEvent(ev) {
     }
     case "notify": {
       showNotification(ev);
+      return;
+    }
+    case "bot_calls": {
+      const b = state.bots.find((x) => x.id === ev.botId);
+      if (!b) return;
+      b.call_count = ev.count;
+      renderSidebar();
+      if (b.id === state.botId) renderDetails();
       return;
     }
     case "activity": {
@@ -348,7 +370,7 @@ function handleEvent(ev) {
       state.groups = state.groups.filter((g) => g.id !== ev.groupId);
       if (state.groupId === ev.groupId) {
         state.groupId = null;
-        selectBot(state.bots[0]?.id ?? null);
+        selectBot((hereBots()[0] ?? state.bots[0])?.id ?? null);
       } else renderSidebar();
       return;
     }
@@ -382,7 +404,7 @@ function handleEvent(ev) {
     case "bot_archived": {
       refreshInbox();
       state.bots = state.bots.filter((b) => b.id !== ev.botId);
-      if (state.botId === ev.botId) selectBot(state.bots[0]?.id ?? null);
+      if (state.botId === ev.botId) selectBot((hereBots()[0] ?? state.bots[0])?.id ?? null);
       else renderSidebar();
       return;
     }
@@ -482,6 +504,16 @@ async function refreshAll() {
     state.groups = s.groups;
     state.agents = s.agents;
     state.chiefDefaultRole = s.chief_default_role;
+    state.workspaces = s.workspaces;
+    state.workspaceTemplates = s.workspace_templates;
+    state.agentStatus = s.agents;
+    if (!state.workspaceId) {
+      let saved = null;
+      try {
+        saved = window.localStorage.getItem("bot-platform:workspace");
+      } catch {}
+      state.workspaceId = s.workspaces.some((w) => w.id === saved) ? saved : "default";
+    }
     state.steerable = s.steerable ?? [];
     applyAppearance(s.settings);
     restartQuotaTimer();
@@ -489,7 +521,7 @@ async function refreshAll() {
     if (!currentEntity()) {
       const { botId, groupId, convId } = readHash();
       if (s.groups.some((g) => g.id === groupId)) return selectGroup(groupId, convId);
-      const target = s.bots.find((b) => b.id === botId) ? botId : s.bots[0]?.id;
+      const target = s.bots.find((b) => b.id === botId) ? botId : (hereBots()[0] ?? s.bots[0])?.id;
       if (target) return selectBot(target, convId);
     }
     if (state.convId && !currentConv()) state.convId = null;
@@ -652,6 +684,83 @@ function renderMainOnly() {
   renderMain({});
 }
 
+function workspaceBar() {
+  const list = h("select", { class: "workspace-select", "aria-label": "切换工作空间", onchange: (e) => switchWorkspace(e.target.value) }, (state.workspaces ?? []).map((w) => h("option", { value: w.id }, w.name)));
+  list.value = state.workspaceId ?? "default";
+  return h("div", { class: "workspace-bar" }, list, h("button", { class: "icon-btn", type: "button", "aria-label": "新建工作空间", title: "新建工作空间", onclick: openWorkspaceDialog }, icon("plus", 16)));
+}
+
+async function switchWorkspace(id) {
+  enterWorkspace(id);
+  const first = hereBots().find((b) => b.is_chief) ?? hereBots()[0];
+  if (first) return selectBot(first.id);
+  const group = hereGroups()[0];
+  if (group) return selectGroup(group.id);
+  state.botId = null;
+  state.groupId = null;
+  state.convId = null;
+  render();
+}
+
+function openWorkspaceDialog() {
+  const dlg = $("bot-dialog");
+  const status = state.agentStatus ?? {};
+  const usable = Object.entries(status).filter(([, a]) => a?.installed).flatMap(([agent, a]) => (a.models ?? []).map((model) => ({ agent, model })));
+  const key = (m) => `${m.agent}|${m.model}`;
+  const name = h("input", { maxlength: 40, placeholder: "比如：肝脏肿瘤分割", "aria-label": "名称" });
+  const folder = h("input", { placeholder: "留空则放在 ~/BotWorkspaces/ 下，也可以填已有目录", "aria-label": "目录" });
+  const goal = h("textarea", { rows: 3, maxlength: 4000, placeholder: "这个工作空间要做成什么（可不填，之后能改）", "aria-label": "目标" });
+  const picks = state.workspaceTemplates.map((t) => {
+    const check = h("input", { type: "checkbox", checked: t.on ? true : null, disabled: t.required ? true : null, "aria-label": t.name });
+    const model = h("select", { "aria-label": `${t.name} 的模型` }, usable.map((m) => h("option", { value: key(m) }, `${AGENT_LABEL[m.agent]} · ${modelLabel(m.model)}`)));
+    // The suggested model, unless that agent is not installed here.
+    model.value = usable.some((m) => m.agent === t.agent && m.model === t.model) ? `${t.agent}|${t.model}` : (usable[0] ? key(usable[0]) : "");
+    return { t, check, model };
+  });
+  const error = h("p", { class: "send-error", role: "alert", hidden: true });
+  const create = async () => {
+    try {
+      const bots = picks.filter((p) => p.t.required || p.check.checked).map((p) => {
+        const [agent, model] = p.model.value.split("|");
+        return { key: p.t.key, agent, model };
+      });
+      const made = await api("/api/workspaces", { method: "POST", body: { name: name.value, cwd: folder.value, goal: goal.value, bots } });
+      dlg.close();
+      const fresh = await api("/api/state");
+      state.bots = fresh.bots;
+      state.groups = fresh.groups;
+      state.workspaces = fresh.workspaces;
+      enterWorkspace(made.id);
+      await selectBot(made.bots[0].id);
+      if (made.notes.length) {
+        state.sendError = made.notes.join(" ");
+        renderComposerState();
+      }
+    } catch (e) {
+      error.hidden = false;
+      error.textContent = e.message;
+    }
+  };
+  setChildren(
+    dlg,
+    h(
+      "div",
+      {},
+      h("h2", {}, "新建工作空间"),
+      h("p", { class: "muted small" }, "会创建目录、初始化 Git，并建一组只属于这个工作空间的 Bot。不同工作空间的 Bot 互相看不到，也不能互相调用。"),
+      h("label", { class: "project-field" }, "名称", name),
+      h("label", { class: "project-field" }, "目录", folder),
+      h("label", { class: "project-field" }, "目标", goal),
+      h("p", { class: "call-label" }, "团队"),
+      h("div", { class: "workspace-team" }, picks.map((p) => h("div", { class: "workspace-member" }, h("label", { class: "check", title: p.t.summary }, p.check, h("strong", {}, p.t.name), h("span", { class: "muted small" }, p.t.summary)), p.model))),
+      error,
+      h("div", { class: "dialog-actions" }, h("span", { class: "spacer" }), h("button", { type: "button", onclick: () => dlg.close() }, "取消"), h("button", { type: "button", class: "primary", onclick: create }, "创建")),
+    ),
+  );
+  dlg.showModal();
+  name.focus();
+}
+
 function renderSidebar() {
   const root = $("sidebar");
   const convList = (owner) =>
@@ -668,7 +777,7 @@ function renderSidebar() {
         ),
       ),
     );
-  const groupRows = state.groups.map((g) => {
+  const groupRows = hereGroups().map((g) => {
     const selected = g.id === state.groupId;
     const running = g.conversations.some((c) => c.status === "running");
     return h(
@@ -684,7 +793,7 @@ function renderSidebar() {
       selected ? convList(g) : null,
     );
   });
-  const rows = state.bots.map((b) => {
+  const rows = hereBots().map((b) => {
     const selected = b.id === state.botId;
     const running = b.conversations.some((c) => c.status === "running");
     const row = h(
@@ -695,11 +804,13 @@ function renderSidebar() {
       running ? h("span", { class: "status-dot", title: "回复中", role: "img", "aria-label": "回复中" }) : null,
     );
     const convs = selected ? convList(b) : null;
-    return h("div", { class: "bot-group" }, row, convs);
+    const calls = selected && b.call_count ? h("button", { class: "conv-row conv-calls", type: "button", title: "其他 Bot 让它做的事，不在私聊里", onclick: () => openCalls(b) }, icon("inbox", 14), `被调用记录 ${b.call_count}`) : null;
+    return h("div", { class: "bot-group" }, row, convs, calls);
   });
   setChildren(
     root,
     h("div", { class: "side-brand" }, h("span", { class: "side-logo", "aria-hidden": "true" }, h("span"), h("span"), h("span"), h("span")), "Bot Platform"),
+    workspaceBar(),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "群聊"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建群聊", title: "新建群聊", onclick: () => openGroupDialog() }, icon("plus", 16))),
     h("div", { class: "bot-list" }, groupRows.length ? groupRows : h("p", { class: "empty-hint" }, "把几个 Bot 拉进群聊，需要谁就 @ 谁。")),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "Bots"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建 Bot", title: "新建 Bot", onclick: () => openBotDialog() }, icon("plus", 16))),
@@ -905,6 +1016,34 @@ let projectTimer = 0;
 function refreshProjectPage() {
   clearTimeout(projectTimer);
   projectTimer = setTimeout(() => state.view === "project" && state.page?.refresh(), 500);
+}
+
+function openCalls(bot) {
+  saveDraft();
+  state.view = "calls";
+  state.sidebarOpen = false;
+  $("app").classList.remove("sidebar-open");
+  $("app").classList.add("full-page");
+  state.page = mountCalls($("main"), {
+    api,
+    h,
+    bot,
+    compact,
+    itemNode,
+    onBack: () => {
+      leaveResearch();
+      render({ focus: true });
+    },
+    // A call deep in a chain has its card in the caller's session, so the conversation is as near as it gets.
+    onJump: (c) => (c.item_id ? jumpToItem({ id: c.item_id, conv_id: c.conv_id, bot_id: c.bot_id, group_id: c.group_id }) : c.group_id ? selectGroup(c.group_id, c.conv_id) : selectBot(c.bot_id, c.conv_id)),
+  });
+  renderSidebar();
+}
+
+let callsTimer = 0;
+function refreshCallsPage() {
+  clearTimeout(callsTimer);
+  callsTimer = setTimeout(() => state.view === "calls" && state.page?.refresh(), 500);
 }
 
 function openArtifacts(wholeProject) {
@@ -1428,7 +1567,7 @@ function planNode(item, attrs) {
   if (!planDrafts.has(item.id)) planDrafts.set(item.id, { tasks: d.tasks.map((t) => ({ ...t, depends_on: [...t.depends_on] })), feedback: "", error: null });
   const draft = planDrafts.get(item.id);
   const redraw = () => replaceItemNode(item);
-  const owners = state.bots.filter((b) => !b.paused && b.name !== d.from);
+  const owners = hereBots().filter((b) => !b.paused && b.name !== d.from);
   const step = (t, i) => {
     const owner = h("select", { "aria-label": "负责人", onchange: (e) => (t.bot = e.target.value) }, owners.map((b) => h("option", { value: b.name }, b.name)));
     owner.value = t.bot;
@@ -1761,7 +1900,7 @@ function errorNode(item, attrs) {
       : h(
           "div",
           { class: "approval-actions" },
-          canRetry(item) ? h("button", { type: "button", title: "再跑一次失败的这一步，预算、调用限制和审批照常生效。这一轮已经结束时会新开一轮，占用一份每轮预算", onclick: (e) => retryFailure(item, e.currentTarget) }, "重试这一步") : null,
+          canRetry(item) ? h("button", { type: "button", title: "再跑一次失败的这一步，预算、调用限制和审批照常生效。这一轮已经结束时会新开一轮，计入项目预算", onclick: (e) => retryFailure(item, e.currentTarget) }, "重试这一步") : null,
           h("button", { type: "button", onclick: () => openHandoffDialog(item) }, "换 Bot 接手"),
           h("button", { type: "button", onclick: () => addToComposer(`${d.bot ? `@${d.bot.name} ` : ""}补充信息：`) }, "补充信息"),
         ),
@@ -1815,13 +1954,13 @@ function openHandoffDialog(item) {
     const note = from === undefined || from === null ? "工作目录可能不同，不一定看得到上一位的改动" : from === b.cwd ? "工作目录相同" : `工作目录不同（${b.cwd}），看不到上一位的改动`;
     return h("button", { type: "button", class: "handoff-row", onclick: (e) => choose(b, e.currentTarget) }, h("span", { class: "handoff-name" }, avatar(b.id, 22), b.name, b.paused ? h("span", { class: "tag muted-tag" }, "已暂停") : null), h("span", { class: "muted small" }, note));
   };
-  const bots = state.bots.filter((b) => b.id !== failed);
+  const bots = hereBots().filter((b) => b.id !== failed);
   dlg.replaceChildren(
     h(
       "div",
       {},
       h("h2", {}, "换 Bot 接手"),
-      h("p", { class: "muted small" }, "会和它新开一个对话，把原来的请求、失败原因和平台记录到的改动写给它。上一位的会话上下文带不过去，它要先检查现状。这会占用它的一份每轮预算，审批按它自己的设置。"),
+      h("p", { class: "muted small" }, "会和它新开一个对话，把原来的请求、失败原因和平台记录到的改动写给它。上一位的会话上下文带不过去，它要先检查现状。这会占用它的一份预算，审批按它自己的设置。"),
       bots.length ? h("div", { class: "handoff-list" }, bots.map(row)) : h("p", { class: "muted" }, "没有别的 Bot 可以接手。"),
       error,
       h("div", { class: "dialog-actions" }, h("span", { class: "spacer" }), h("button", { type: "button", onclick: () => dlg.close() }, "取消")),
@@ -1874,9 +2013,9 @@ function traceSection() {
     return row;
   });
   return [
-    h("h2", { class: "section" }, active ? "本轮预算（进行中）" : "上一轮用量"),
-    bar,
-    h("p", { class: "muted small budget-text" }, `${compact(spent)} / ${compact(limit)} tokens（不含缓存）`),
+    h("h2", { class: "section" }, limit ? (active ? "本轮预算（进行中）" : "上一轮用量") : active ? "本轮用量（进行中）" : "上一轮用量"),
+    limit ? bar : null,
+    h("p", { class: "muted small budget-text" }, limit ? `${compact(spent)} / ${compact(limit)} tokens（不含缓存）` : `${compact(spent)} tokens（不含缓存）`),
     t.calls.length ? h("h2", { class: "section" }, "调用链") : null,
     tree,
   ];
@@ -1915,6 +2054,7 @@ function budgetSection(entity) {
       "div",
       { class: "project-links" },
       h("button", { type: "button", onclick: openProject }, "项目工作台"),
+      currentGroup() ? null : h("button", { type: "button", onclick: () => openCalls(entity) }, `被调用记录${entity.call_count ? ` ${entity.call_count}` : ""}`),
       h("button", { type: "button", onclick: openArtifacts }, "产物和附件"),
       state.convId ? h("a", { class: "button", href: `/api/conversations/${state.convId}/export`, download: "", title: "这个对话的 Markdown，工具调用只列名称" }, "导出对话") : null,
       h("a", { class: "button", href: `/api/projects/${entity.project_memory}/backup?cwd=${encodeURIComponent(entity.cwd)}`, download: "", title: "这个项目的对话、任务、记忆、附件和实验记录。不含工作目录，也不能导入回来" }, "备份项目"),
@@ -2134,7 +2274,6 @@ function renderDetails() {
       row("模型", b.model),
       row("强度", EFFORT_LABEL[b.effort]),
       row("权限", PERMISSION_LABEL[b.permission]),
-      row("每轮预算", `${compact(b.budget_tokens)} tokens`),
       row("可调用", b.can_call === null ? "所有 Bot" : b.can_call.length ? b.can_call.map((id) => botById(id)?.name).filter(Boolean).join("、") : "无"),
       b.agent === "codex" ? row("路由", ROUTE_LABEL[b.route]) : null,
       h("div", { class: "kv stacked" }, h("dt", {}, "工作目录"), h("dd", { class: "path", title: b.cwd }, b.cwd)),
@@ -2178,8 +2317,7 @@ function openBotDialog(bot, proposal) {
         const f = new FormData(form);
         const body = Object.fromEntries([...f.entries()].filter(([k]) => k !== "cc"));
         if (body.agent !== "codex") delete body.route;
-        body.budget_tokens = Number(body.budget_tokens);
-        const others = state.bots.filter((x) => x.id !== bot?.id);
+        const others = hereBots().filter((x) => x.id !== bot?.id);
         const picked = f.getAll("cc");
         if (!proposal) body.can_call = picked.length === others.length ? null : picked;
         if (proposal) delete body.route;
@@ -2197,7 +2335,7 @@ function openBotDialog(bot, proposal) {
           return;
         }
         try {
-          await api(bot ? `/api/bots/${bot.id}` : "/api/bots", { method: bot ? "PATCH" : "POST", body });
+          await api(bot ? `/api/bots/${bot.id}` : "/api/bots", { method: bot ? "PATCH" : "POST", body: bot ? body : { ...body, workspace_id: state.workspaceId } });
           const fresh = await api("/api/state");
           state.bots = fresh.bots;
           state.groups = fresh.groups;
@@ -2229,17 +2367,16 @@ function openBotDialog(bot, proposal) {
       h("label", { class: "field", for: "f-permission" }, "权限", h("select", { id: "f-permission", name: "permission" }, Object.entries(PERMISSION_LABEL).map(([k, v]) => h("option", { value: k }, v)))),
     ),
     routeWrap,
-    h("label", { class: "field", for: "f-budget" }, "每轮预算（tokens，不含缓存）", h("input", { id: "f-budget", name: "budget_tokens", type: "number", min: 1000, step: 1000, required: true, value: String(src?.budget_tokens ?? state.settings?.default_budget_bot ?? 150000) })),
     bot ? h("label", { class: "field check-inline" }, h("input", { type: "checkbox", name: "paused", checked: bot.paused ? true : null }), "暂停（其他 Bot 不能调用它）") : null,
-    !proposal && state.bots.some((x) => x.id !== bot?.id)
+    !proposal && hereBots().some((x) => x.id !== bot?.id)
       ? h(
           "fieldset",
           { class: "field check-list" },
           h("legend", {}, "可以调用的 Bot"),
-          state.bots.filter((x) => x.id !== bot?.id).map((x) => h("label", {}, h("input", { type: "checkbox", name: "cc", value: x.id, checked: !bot || bot.can_call === null || bot.can_call.includes(x.id) ? true : null }), x.name)),
+          hereBots().filter((x) => x.id !== bot?.id).map((x) => h("label", {}, h("input", { type: "checkbox", name: "cc", value: x.id, checked: !bot || bot.can_call === null || bot.can_call.includes(x.id) ? true : null }), x.name)),
         )
       : null,
-    proposal ? null : h("label", { class: "field", for: "f-cwd" }, "工作目录", h("input", { id: "f-cwd", name: "cwd", value: bot?.cwd ?? "", placeholder: "留空则使用这个 Bot 的独立目录", autocomplete: "off" })),
+    proposal ? null : h("label", { class: "field", for: "f-cwd" }, "工作目录", h("input", { id: "f-cwd", name: "cwd", value: bot?.cwd ?? "", placeholder: state.workspaceId === "default" ? "留空则使用这个 Bot 的独立目录" : "留空则使用工作空间的目录", autocomplete: "off" })),
     h("p", { class: "muted small" }, "选“自动改文件”时，Codex 还可以写系统临时目录。写到其他位置会被拦下或询问。"),
     bot ? h("p", { class: "muted small" }, "工作目录和底层 agent 的改动只对新对话生效。") : null,
     error,
@@ -2276,7 +2413,7 @@ function openGroupDialog(group) {
         if (f.get("cwd")) body.cwd = f.get("cwd");
         error.hidden = true;
         try {
-          const saved = await api(group ? `/api/groups/${group.id}` : "/api/groups", { method: group ? "PATCH" : "POST", body });
+          const saved = await api(group ? `/api/groups/${group.id}` : "/api/groups", { method: group ? "PATCH" : "POST", body: group ? body : { ...body, workspace_id: state.workspaceId } });
           const i = state.groups.findIndex((g) => g.id === saved.id);
           if (i >= 0) state.groups[i] = saved;
           else state.groups.push(saved);
@@ -2295,10 +2432,10 @@ function openGroupDialog(group) {
       "fieldset",
       { class: "field check-list" },
       h("legend", {}, "成员（至少两个）"),
-      state.bots.map((b) => h("label", {}, h("input", { type: "checkbox", name: "members", value: b.id, checked: group?.members.includes(b.id) ? true : null }), `${b.name}（${AGENT_LABEL[b.agent]}）`)),
+      hereBots().map((b) => h("label", {}, h("input", { type: "checkbox", name: "members", value: b.id, checked: group?.members.includes(b.id) ? true : null }), `${b.name}（${AGENT_LABEL[b.agent]}）`)),
     ),
     h("label", { class: "field", for: "g-budget" }, "每轮预算（tokens，不含缓存）", h("input", { id: "g-budget", name: "budget_tokens", type: "number", min: 1000, step: 1000, required: true, value: String(group?.budget_tokens ?? state.settings?.default_budget_group ?? 300000) })),
-    h("label", { class: "field", for: "g-cwd" }, "共用工作目录", h("input", { id: "g-cwd", name: "cwd", value: group?.cwd ?? "", placeholder: "留空则使用这个群聊的独立目录", autocomplete: "off" })),
+    h("label", { class: "field", for: "g-cwd" }, "共用工作目录", h("input", { id: "g-cwd", name: "cwd", value: group?.cwd ?? "", placeholder: state.workspaceId === "default" ? "留空则使用这个群聊的独立目录" : "留空则使用工作空间的目录", autocomplete: "off" })),
     group ? h("p", { class: "muted small" }, "工作目录的改动只对新对话生效。") : null,
     error,
     h(

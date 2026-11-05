@@ -17,7 +17,6 @@ const spec = {
   model: { type: "string", enum: ["claude-opus-5-5", "claude-sonnet-5-5", "gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna", "grok-4.7", "grok-4.7-build-fast", "grok-4.6", "gemini-4-argon", "gemini-3.8-flash"] },
   effort: { type: "string", enum: ["low", "medium", "high"] },
   permission: { type: "string", enum: ["ask", "auto_edit", "read_only"] },
-  budget_tokens: { type: "number" },
 };
 const tools = [
   { name: "list_bots", description: "列出你可以调用的 Bot，以及它们的职责。", inputSchema: { type: "object", properties: {} } },

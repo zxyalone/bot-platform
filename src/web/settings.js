@@ -95,7 +95,6 @@ export function mountSettings(root, ctx) {
         row("底层 agent", null, select("default_agent", agents.map((a) => [a, agentLabel[a]]), "默认底层 agent")),
         row("强度", null, segmented("default_effort", [["low", "低"], ["medium", "中"], ["high", "高"]], "默认强度")),
         row("权限", "Chief 提议新 Bot 时，也按这里补全没写的项", select("default_permission", Object.entries(permissionLabel), "默认权限")),
-        row("每轮预算", "tokens，不含缓存", number("default_budget_bot", "Bot 每轮预算", 1000, 50000000, 1000)),
       ),
       group("新建群聊时预填", row("每轮预算", "tokens，不含缓存", number("default_budget_group", "群聊每轮预算", 1000, 50000000, 1000))),
     ];

@@ -214,7 +214,8 @@ test("a task nobody collected ends with that reason, and so does one still waiti
 });
 
 test("stopping or running out of budget gives its own reason", async () => {
-  const s = await setup({ budget: 1000 });
+  const s = await setup();
+  await s.t.api("PUT", `/api/projects/${s.bots.A.project_memory}/settings`, { budget_total: 1000 });
   const convId = await s.say("A");
   const a = await s.waitRt("A");
   const spent = await s.assign(a, { bot: "B" });
@@ -448,7 +449,8 @@ test("retry after the round ended opens a new one with its budget, approvals sti
 });
 
 test("a retried task's budget overrun stops it like any other round", async () => {
-  const s = await setup({ budget: 1000 });
+  const s = await setup();
+  await s.t.api("PUT", `/api/projects/${s.bots.A.project_memory}/settings`, { budget_total: 1000 });
   const convId = await s.say("A");
   const a = await s.waitRt("A");
   const first = await s.assign(a, { bot: "B" });
