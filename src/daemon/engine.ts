@@ -288,7 +288,7 @@ export class Engine {
 
   activity(convId: string) {
     const root = this.roots.get(convId);
-    if (!root) return null;
+    if (!root) return this.store.getConversation(convId)?.status === "running" ? { kind: "working", text: "正在保存这一轮的结果", at: Date.now() } : null;
     const at = root.lastActivity;
     if (root.stopping) return { kind: "stopping", text: "正在停止", at };
     for (const l of root.active) {
@@ -316,14 +316,16 @@ export class Engine {
     this.roots.delete(root.convId);
     if (root.activityTimer) clearTimeout(root.activityTimer);
     root.activityTimer = null;
-    this.publish({ type: "activity", convId: root.convId, activity: null });
+    this.publish({ type: "activity", convId: root.convId, activity: this.activity(root.convId) });
     const status = root.overBudget ? "over_budget" : root.stopping ? "interrupted" : root.failed ? "failed" : "completed";
     this.store.updateRootTurn(root.id, root.spent, status);
     this.broadcastBudget(root, false);
-    this.setConversation(root.convId, { status: "idle" });
-    // The next round's baseline must be taken after this one's card is written.
-    void this.postResult(root, status).then(() => {
+    // The conversation stays busy until the result is saved. Otherwise the next round could change the
+    // files between this one ending and its diff being taken. Every way of starting a round checks this.
+    void this.postResult(root, status).catch(() => {}).then(() => {
       if (this.closed) return;
+      this.setConversation(root.convId, { status: "idle" });
+      this.publish({ type: "activity", convId: root.convId, activity: null });
       if (halted) this.dropQueue(root.convId, root.overBudget ? "这一轮的预算用完了，没有发出" : "这一轮被停止了，没有发出");
       else if (this.pumpQueue(root.convId)) return;
       const queued = this.pendingWakes.get(root.convId);
@@ -700,7 +702,8 @@ export class Engine {
   // ---------- running one agent turn ----------
   private runTurn(bot: Bot, sessionConvId: string, prompt: string, ctx: TurnCtx, extraSystem = ""): Promise<TurnResult> {
     return new Promise<TurnResult>((resolve) => {
-      if (ctx.root.stopping) return resolve({ status: "interrupted", text: "", tokens: 0 });
+      const stopped = () => ctx.root.stopping || ctx.callPath.some((id) => ctx.root.tasks.get(id)?.cancelled || ctx.root.tasks.get(id)?.timedOut);
+      if (stopped()) return resolve({ status: "interrupted", text: "", tokens: 0 });
       const turnId = randomUUID();
       void (async () => {
         try {
@@ -709,10 +712,10 @@ export class Engine {
           if (this.closed) return;
           const live = await this.ensureRuntime(bot, sessionConvId, extraSystem, ctx);
           if (this.live.get(sessionConvId) !== live) throw new Error("进程启动后立刻退出了");
+          // Starting can take a while, and the person may have cancelled this meanwhile. Nothing has been sent yet, so nothing needs undoing.
+          if (stopped()) return resolve({ status: "interrupted", text: "", tokens: 0 });
           Object.assign(live, { turnId, turnStarted: Date.now(), lastUsed: Date.now(), usage: null, ctx, resolve, ticks: 0, turnTokens: 0, texts: [], files: new Set(), lateConv: null });
           ctx.root.active.add(live);
-          // The stop may have come while the agent was still starting.
-          if (ctx.root.stopping) void this.interruptLive(live);
           await live.runtime.send(prompt);
         } catch (e) {
           const message = `无法启动 ${bot.agent}：${(e as Error).message}`;
@@ -1126,7 +1129,7 @@ export class Engine {
   private wake(convId: string, notice: string) {
     const conv = this.store.getConversation(convId);
     if (!conv) return;
-    if (this.roots.has(convId)) {
+    if (conv.status === "running") {
       this.pendingWakes.set(convId, [...(this.pendingWakes.get(convId) ?? []), notice]);
       return;
     }
@@ -1458,6 +1461,7 @@ export class Engine {
     if (budget === undefined) throw new HttpError(409, "这个对话所属的 Bot 或群聊已归档");
 
     const open = this.roots.get(conv.id);
+    if (!open && conv.status === "running") throw new HttpError(409, "上一轮的结果还在保存，请稍后再试");
     const dependsOn = row.depends_on ? (JSON.parse(row.depends_on as string) as string[]) : [];
     const depRefusal = this.dependencyRefusal(dependsOn, conv.id);
     if (depRefusal) throw new HttpError(409, `${depRefusal}，请先重试它`);

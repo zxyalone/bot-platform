@@ -310,3 +310,123 @@ test("a task that can be retried says where, whether earlier work stays, and wha
   assert.equal(info.worktree, null);
   await s.end();
 });
+
+// ---------- timing ----------
+// An agent that takes its time starting, so a person can act while nothing has been sent yet.
+class SlowStart extends Fake {
+  release!: () => void;
+  gate = new Promise<void>((r) => (this.release = r));
+  async start() {
+    await this.gate;
+  }
+}
+async function slowSetup() {
+  const made: Fake[] = [];
+  const t = await boot((o) => {
+    const f = o.systemPrompt.startsWith("ROLE-SLOW") ? new SlowStart(o) : new Fake(o);
+    made.push(f);
+    return f;
+  });
+  const cwd = mkdtempSync(join(tmpdir(), "bot-proj-"));
+  const mk = async (name: string, role: string) => (await t.api("POST", "/api/bots", { name, role, agent: "codex", model: "gpt-6-luna", cwd })).body;
+  const boss = await mk("A", "ROLE-A");
+  await mk("B", "ROLE-SLOW");
+  await t.api("POST", `/api/bots/${boss.id}/messages`, { text: "go" });
+  await t.waitFor(() => made[0]?.sent.length, "caller");
+  const a = made[0];
+  const assign = async (args: object) => JSON.parse((await fetch(`${t.base}/internal/bus`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${a.opts.bus!.env.BUS_TOKEN}` }, body: JSON.stringify({ tool: "assign_task", args }) }).then((r) => r.json()) as any).text) as { task_id: string };
+  const task = async (id: string) => (await t.api("GET", "/api/tasks")).body.tasks.find((x: any) => x.id === id);
+  const slow = async () => {
+    await t.waitFor(() => made[1], "slow agent starting");
+    return made[1] as SlowStart;
+  };
+  return { t, a, assign, task, slow };
+}
+
+test("a task cancelled while its agent is still starting is never sent, and stays cancelled", async () => {
+  const s = await slowSetup();
+  const { task_id } = await s.assign({ bot: "B", task: "不该执行" });
+  const b = await s.slow();
+  assert.equal((await s.t.api("POST", `/api/tasks/${task_id}/cancel`, {})).status, 202);
+  b.release();
+  await s.t.waitFor(async () => (await s.task(task_id)).status !== "running", "ended");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(b.sent, [], "nothing reached the agent");
+  const x = await s.task(task_id);
+  assert.equal(x.status, "interrupted");
+  assert.match(x.failure_reason, /你取消/);
+  s.a.reply();
+  await new Promise((r) => setTimeout(r, 50));
+  s.t.close();
+});
+
+test("stopping the whole round while an agent is still starting sends it nothing", async () => {
+  const s = await slowSetup();
+  const { task_id } = await s.assign({ bot: "B", task: "不该执行" });
+  const b = await s.slow();
+  const conv = (await s.task(task_id)).conv_id;
+  await s.t.api("POST", `/api/conversations/${conv}/interrupt`, {});
+  b.release();
+  await s.t.waitFor(async () => (await s.task(task_id)).status === "interrupted", "ended");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(b.sent, []);
+  s.t.close();
+});
+
+test("a task that times out while its agent is still starting is never sent either", async () => {
+  const s = await slowSetup();
+  const { task_id } = await s.assign({ bot: "B", task: "不该执行", timeout_seconds: 0.05 });
+  const b = await s.slow();
+  await new Promise((r) => setTimeout(r, 200));
+  b.release();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(b.sent, []);
+  await s.t.waitFor(async () => (await s.task(task_id)).status === "timeout", "timeout", 12000);
+  s.a.reply();
+  await new Promise((r) => setTimeout(r, 50));
+  s.t.close();
+});
+
+test("the next message cannot start until this round's result is saved", async () => {
+  const cwd = repo();
+  const s = await setup(cwd);
+  const conv = await s.say();
+  const a = await s.waitRt("A");
+  writeFileSync(join(cwd, "a.py"), "round-one\n");
+  a.reply();
+  // As fast as a person or a script could: send the moment it is allowed, and change the file at once.
+  await s.t.waitFor(async () => (await s.t.api("POST", `/api/bots/${s.bots.A.id}/messages`, { text: "再来", conversationId: conv })).status === 202, "next message accepted");
+  writeFileSync(join(cwd, "a.py"), "round-two\n");
+  const cards = (await s.items(conv)).filter((i) => i.type === "result");
+  assert.equal(cards.length, 1, "the card was already there when the next round began");
+  const d = await diffOf(s, cards[0].id);
+  assert.match(d.diff, /\+round-one/);
+  assert.doesNotMatch(d.diff, /round-two/);
+  await s.waitRt("A", 2);
+  a.reply();
+  await s.end();
+});
+
+test("while a result is being saved, the status says so and a retry waits too", async () => {
+  const cwd = repo();
+  const s = await setup(cwd);
+  const conv = await s.say();
+  const a = await s.waitRt("A");
+  const { task_id } = await s.assign(a, { bot: "B", task: "一" });
+  await s.waitRt("B");
+  await s.t.api("POST", `/api/tasks/${task_id}/cancel`, {});
+  await s.settle(task_id, "interrupted");
+  writeFileSync(join(cwd, "a.py"), "round-one\n");
+  a.reply();
+  const retried = await s.t.waitFor(async () => {
+    const r = await s.t.api("POST", `/api/tasks/${task_id}/retry`, {});
+    return r.status === 202 && r;
+  }, "retry accepted");
+  assert.ok(retried);
+  const list = await s.items(conv);
+  const card = list.findIndex((i) => i.type === "result");
+  const retry = list.findIndex((i) => i.type === "call" && i.data.retry);
+  assert.ok(card >= 0 && card < retry, "the result belongs to the round before the retry");
+  (await s.waitRt("B", 2)).reply("好");
+  await s.end();
+});
