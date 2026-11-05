@@ -110,6 +110,16 @@ export function mountSettings(root, ctx) {
         row("同时进行", "超过时新的调用会被拒绝", number("max_active", "同时进行的调用", 1, 10)),
         row("任务超时", "分钟。后台任务运行超过这么久就停止，Bot 只能设得更短，等你审批的时间不算。0 表示不限", number("task_timeout_minutes", "任务超时分钟数", 0, 1440)),
       ),
+      group("全局", row("同时运行的 agent", "所有对话加起来。满了之后新消息会被拒绝，排队的消息和后台任务继续等。主 Bot 等后台任务时不占调用名额，所以峰值可能略高", number("max_global_active", "同时运行的 agent", 1, 50))),
+      group(
+        "通知",
+        row("完成与待处理通知", "窗口不在前台时提醒：任务完成、失败、等你批准、预算快用完。页面关掉就收不到。可以在每个项目的预算设置里静音", toggle("notify_enabled", "完成与待处理通知")),
+        row(
+          "浏览器权限",
+          !("Notification" in window) ? "这个浏览器不支持系统通知" : Notification.permission === "granted" ? "已允许" : Notification.permission === "denied" ? "已被拒绝，需要在浏览器的网站设置里打开" : "还没有允许",
+          "Notification" in window && Notification.permission === "default" ? h("button", { type: "button", onclick: () => Notification.requestPermission().then(draw) }, "允许通知") : null,
+        ),
+      ),
       group("进程", row("空闲回收", "分钟。agent 进程空闲这么久后关闭，下次发消息时自动恢复会话", number("idle_minutes", "空闲回收分钟数", 1, 1440))),
       h("p", { class: "set-note" }, "调高这些限制会让一条消息可能花掉更多额度。预算在“新建默认值”和每个 Bot 的设置里调整。"),
     ];

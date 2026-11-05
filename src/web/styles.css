@@ -373,6 +373,8 @@ summary::-webkit-details-marker { display: none; }
 .trace-row.refused .trace-name { color: var(--danger); }
 .memory-links { display: flex; gap: 6px; flex-wrap: wrap; }
 .memory-links button { padding: 2px 10px; font-size: 0.82rem; }
+.budget-form { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 8px 0; font-size: 0.85rem; }
+.budget-form label { display: flex; align-items: center; gap: 6px; }
 .module-row { display: flex; gap: 10px; align-items: flex-start; font-size: 0.85rem; }
 .module-row > span { flex: 1; }
 .module-row button { padding: 2px 10px; font-size: 0.82rem; flex: none; }

@@ -71,6 +71,8 @@ const SETTING_RULES: Record<string, string[] | [number, number] | "boolean"> = {
   max_depth: [1, 10],
   max_calls: [1, 100],
   max_active: [1, 10],
+  max_global_active: [1, 50],
+  notify_enabled: "boolean",
   task_timeout_minutes: [0, 1440],
   low_quota: [1, 90],
   quota_refresh_minutes: [1, 120],
@@ -415,6 +417,11 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       if (m === "GET" && parts[3] === "research") {
         const experiments = r.listExperiments(pid);
         return json(res, 200, { settings: r.settings(pid), targets: r.listTargets(), ideas: r.listIdeas(pid), experiments, summary: summarize(experiments), finalEvals: r.finalEvalCount(pid) });
+      }
+      if (m === "GET" && parts[3] === "budget") {
+        const cwd = new URL(req.url ?? "/", "http://localhost").searchParams.get("cwd") ?? "";
+        if (Memory.projectId(cwd) !== pid) throw new HttpError(400, "工作目录和项目不一致");
+        return json(res, 200, engine.projectReport(cwd));
       }
       if (m === "PUT" && parts[3] === "settings") return json(res, 200, r.saveSettings(pid, await readJson(req)));
       if (m === "POST" && parts[3] === "ideas") return json(res, 201, r.addIdea(pid, await readJson(req), "用户"));

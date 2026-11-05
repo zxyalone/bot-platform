@@ -19,6 +19,8 @@ export { HttpError };
 const MAX_BOTS = 12;
 export const STEERABLE: AgentKind[] = ["claude", "codex"];
 const MAX_QUEUED = 10;
+const BUDGET_WARN_AT = 0.8;
+const NOTIFY_TEXT = 120;
 const ACTIVITY_MS = 300;
 const BASELINE_WAIT_MS = 2000;
 const MAX_RESULT_FILES = 100;
@@ -51,6 +53,8 @@ interface RootTurn {
   stopNote: string | null;
   tasks: Map<string, TaskRun>;
   baseline: Promise<WorkState | null>;
+  cwd: string;
+  projectOver: boolean;
   startedAt: number;
   lastActivity: number;
   activityTimer: NodeJS.Timeout | null;
@@ -189,6 +193,9 @@ export class Engine {
   private readonly roots = new Map<string, RootTurn>();
   // Sessions promised to a call. Taken before anything awaits, because an agent still starting has no turn to look at yet.
   private readonly sessionsInUse = new Set<string>();
+  // Conversations with something to send, held back only because no slot is free.
+  private readonly slotWaiters = new Set<string>();
+  private readonly budgetWarned = new Set<string>();
   private readonly reaper: NodeJS.Timeout;
 
   constructor(o: { store: Store; factory: RuntimeFactory; broadcast: Broadcast; idleMs?: number; busUrl: () => string; validateBot: (input: any, existing?: Bot) => Promise<any>; pollMs?: number; sshPollMs?: number }) {
@@ -258,12 +265,101 @@ export class Engine {
 
   private openRoot(convId: string, limit: number): RootTurn {
     const now = Date.now();
-    const root: RootTurn = { id: randomUUID(), convId, limit, spent: 0, callCount: 0, activeCalls: 0, active: new Set(), stopping: false, overBudget: false, stopNote: null, tasks: new Map(), baseline: workState(this.store.getConversation(convId)!.cwd), startedAt: now, lastActivity: now, activityTimer: null, files: new Set(), checks: [], lastText: "" };
+    const cwd = this.store.getConversation(convId)!.cwd;
+    const root: RootTurn = { id: randomUUID(), convId, limit, spent: 0, callCount: 0, activeCalls: 0, active: new Set(), stopping: false, overBudget: false, stopNote: null, tasks: new Map(), baseline: workState(cwd), cwd, projectOver: false, startedAt: now, lastActivity: now, activityTimer: null, files: new Set(), checks: [], lastText: "" };
     this.roots.set(convId, root);
     this.store.createRootTurn(root.id, convId, limit);
     this.broadcastBudget(root, true);
     this.touch(root);
     return root;
+  }
+
+  // ---------- across the whole project ----------
+  private projectBudget(cwd: string) {
+    const s = this.research.settings(Memory.projectId(cwd));
+    const midnight = new Date().setHours(0, 0, 0, 0);
+    return {
+      project_id: Memory.projectId(cwd),
+      muted: Boolean(s.muted),
+      total: { spent: this.store.projectSpent(cwd, 0), limit: s.budget_total as number },
+      today: { spent: this.store.projectSpent(cwd, midnight), limit: s.budget_daily as number },
+    };
+  }
+
+  projectReport(cwd: string) {
+    const { conversations, calls } = this.store.projectSpending(cwd);
+    return { ...this.projectBudget(cwd), by_conversation: conversations, by_call: calls.map((c) => ({ id: c.id, owner: c.to_bot, title: firstLine(c.question), tokens: c.tokens, status: c.status, mode: c.mode })) };
+  }
+
+  private overBudget(cwd: string) {
+    const b = this.projectBudget(cwd);
+    if (b.today.limit > 0 && b.today.spent >= b.today.limit) return `这个项目今天的预算用完了（${b.today.spent} / ${b.today.limit} tokens）。可以在右侧面板调高，或者明天再继续`;
+    if (b.total.limit > 0 && b.total.spent >= b.total.limit) return `这个项目的总预算用完了（${b.total.spent} / ${b.total.limit} tokens）。可以在右侧面板调高`;
+    return null;
+  }
+
+  // A round holds a slot from its first message to its last. A running round waiting on a task must
+  // not keep that task from starting, so calls only compete with other calls.
+  private roundSlotsFull() {
+    return this.roots.size + this.sessionsInUse.size >= this.store.settings().max_global_active;
+  }
+
+  private callSlotsFull() {
+    return this.sessionsInUse.size >= this.store.settings().max_global_active;
+  }
+
+  private checkCanStart(cwd: string) {
+    const over = this.overBudget(cwd);
+    if (over) throw new HttpError(409, over);
+    if (this.roundSlotsFull()) throw new HttpError(409, `同时运行的 agent 已达全局上限 ${this.store.settings().max_global_active}，请等一个结束，或者在设置里调高`);
+  }
+
+  private watchBudget(root: RootTurn) {
+    const b = this.projectBudget(root.cwd);
+    if (!b.total.limit && !b.today.limit) return;
+    const over = this.overBudget(root.cwd);
+    if (over) {
+      if (root.overBudget) return;
+      root.overBudget = true;
+      root.projectOver = true;
+      this.addItem(root.convId, null, "error", "done", { message: `${over}。这一轮已自动停止。` });
+      this.notify(root.convId, "budget", over);
+      this.stopRoot(root, "这个项目的预算用完了，已停止");
+      return;
+    }
+    const day = new Date().toDateString();
+    for (const [name, use, key] of [["今天的预算", b.today, `${b.project_id}:${day}:${b.today.limit}`], ["总预算", b.total, `${b.project_id}:total:${b.total.limit}`]] as const) {
+      if (!use.limit || use.spent < use.limit * BUDGET_WARN_AT || this.budgetWarned.has(key)) continue;
+      this.budgetWarned.add(key);
+      const text = `这个项目${name}已用 ${Math.floor((use.spent / use.limit) * 100)}%（${use.spent} / ${use.limit} tokens）`;
+      this.addItem(root.convId, null, "notice", "done", { text, local: true });
+      this.notify(root.convId, "budget", text);
+    }
+  }
+
+  // ---------- telling the person ----------
+  // The page decides whether to show it, since only it knows if the window is in front.
+  private notify(convId: string, kind: "approval" | "done" | "failed" | "budget", body: string, itemId: string | null = null) {
+    const conv = this.store.getConversation(convId);
+    if (!conv || (conv.kind !== "direct" && conv.kind !== "group") || !this.store.settings().notify_enabled) return;
+    if (this.research.settings(Memory.projectId(conv.cwd)).muted) return;
+    this.publish({ type: "notify", kind, title: conv.title, body: clip(body.trim().split("\n")[0], NOTIFY_TEXT), conv_id: convId, bot_id: conv.bot_id, group_id: conv.group_id, item_id: itemId });
+  }
+
+  // A slot came free somewhere: whatever was held back only for that can go, in any conversation.
+  private useFreedSlots() {
+    if (this.closed) return;
+    for (const root of this.roots.values()) this.pumpTasks(root);
+    for (const convId of [...this.slotWaiters]) {
+      this.slotWaiters.delete(convId);
+      this.sendNext(convId);
+    }
+  }
+
+  private sendNext(convId: string) {
+    if (this.pumpQueue(convId)) return;
+    const queued = this.pendingWakes.get(convId);
+    if (queued?.length) this.wake(convId, queued.shift()!);
   }
 
   // ---------- what a round is doing right now ----------
@@ -322,14 +418,16 @@ export class Engine {
     this.broadcastBudget(root, false);
     // The conversation stays busy until the result is saved. Otherwise the next round could change the
     // files between this one ending and its diff being taken. Every way of starting a round checks this.
-    void this.postResult(root, status).catch(() => {}).then(() => {
+    void this.postResult(root, status).catch(() => undefined).then((itemId) => {
       if (this.closed) return;
       this.setConversation(root.convId, { status: "idle" });
       this.publish({ type: "activity", convId: root.convId, activity: null });
-      if (halted) this.dropQueue(root.convId, root.overBudget ? "这一轮的预算用完了，没有发出" : "这一轮被停止了，没有发出");
-      else if (this.pumpQueue(root.convId)) return;
-      const queued = this.pendingWakes.get(root.convId);
-      if (queued?.length) this.wake(root.convId, queued.shift()!);
+      // A person who pressed stop already knows, and running out of budget has said so.
+      if (status === "completed") this.notify(root.convId, "done", root.lastText || "这一轮完成了", itemId);
+      else if (status === "failed") this.notify(root.convId, "failed", "这一轮失败了", itemId);
+      if (halted) this.dropQueue(root.convId, root.projectOver ? "这个项目的预算用完了，没有发出" : root.overBudget ? "这一轮的预算用完了，没有发出" : "这一轮被停止了，没有发出");
+      else this.sendNext(root.convId);
+      this.useFreedSlots();
     }).catch(() => {}); // Only happens when the daemon is shutting down around it.
   }
 
@@ -360,6 +458,7 @@ export class Engine {
       mkdirSync(this.resultsDir, { recursive: true });
       writeFileSync(join(this.resultsDir, `${item.id}.json`), JSON.stringify(snapshot));
     }
+    return item.id;
   }
 
   private get resultsDir() {
@@ -562,6 +661,11 @@ export class Engine {
     if (!conv || conv.status === "running") return false;
     const next = this.store.listItems(convId).find((i) => i.type === "queued" && i.status === "queued");
     if (!next) return false;
+    // Only a free slot is missing, so it stays in line. Running out of budget ends below, as unsent, with the reason.
+    if (this.roundSlotsFull() && !this.overBudget(conv.cwd)) {
+      this.slotWaiters.add(convId);
+      return true;
+    }
     this.updateItem(next.id, { status: "sent" });
     void this.dispatch(conv, String(next.data.text)).catch((e) => {
       this.updateItem(next.id, { status: "unsent", data: { ...next.data, reason: (e as Error).message } });
@@ -590,11 +694,13 @@ export class Engine {
     if (!tokens) return;
     root.spent = Math.max(0, root.spent + tokens);
     this.broadcastBudget(root, true);
+    this.store.setRootSpent(root.id, root.spent);
     if (root.limit > 0 && root.spent >= root.limit && !root.overBudget) {
       root.overBudget = true;
       this.addItem(root.convId, null, "error", "done", { message: `这一轮已用 ${root.spent} tokens，达到预算 ${root.limit}，已自动暂停。要继续可以再发一条消息，或调高预算。`, requestItemId: root.requestItem });
       this.stopRoot(root, "这一轮的预算用完了，已停止");
     }
+    this.watchBudget(root);
   }
 
   private stopRoot(root: RootTurn, note: string) {
@@ -619,6 +725,7 @@ export class Engine {
   async sendMessage(botId: string, conversationId: string | null, text: string): Promise<Conversation> {
     const bot = this.store.getBot(botId);
     if (!bot) throw new HttpError(404, "Bot 不存在");
+    this.checkCanStart((conversationId && this.store.getConversation(conversationId)?.cwd) || bot.cwd);
     const title = text.trim().split("\n")[0].slice(0, 40) || "新对话";
     const conv = conversationId ? this.store.getConversation(conversationId) : this.store.createConversation(bot, title);
     if (!conv || conv.bot_id !== botId || conv.kind !== "direct") throw new HttpError(404, "对话不存在");
@@ -644,6 +751,7 @@ export class Engine {
     // With a Chief in the group, a message to nobody in particular is a message to the Chief.
     if (!mentioned.length) mentioned = members.filter((m) => m.is_chief);
     if (!mentioned.length) throw new HttpError(400, `请 @ 至少一个成员：${members.map((m) => m.name).join("、")}`);
+    this.checkCanStart((conversationId && this.store.getConversation(conversationId)?.cwd) || group.cwd);
     const title = text.trim().split("\n")[0].slice(0, 40) || "新对话";
     const conv = conversationId ? this.store.getConversation(conversationId) : this.store.createGroupConversation(group, title);
     if (!conv || conv.group_id !== groupId) throw new HttpError(404, "对话不存在");
@@ -676,7 +784,7 @@ export class Engine {
   private withNotices(convId: string, text: string) {
     const items = this.store.listItems(convId);
     const lastUser = items.findLastIndex((i) => i.type === "user" && !i.data.steered);
-    const notes = items.slice(lastUser + 1).filter((i) => i.type === "notice").map((i) => `[平台通知，不是用户发的] ${i.data.text}`);
+    const notes = items.slice(lastUser + 1).filter((i) => i.type === "notice" && !i.data.local).map((i) => `[平台通知，不是用户发的] ${i.data.text}`);
     return notes.length ? `${notes.join("\n\n")}\n\n${text}` : text;
   }
 
@@ -692,7 +800,7 @@ export class Engine {
       if (by?.id === bot.id) continue;
       if (i.type === "user") lines.push(`[用户]：${i.data.text}`);
       else if (i.type === "assistant" && i.data.text) lines.push(`[${by?.name ?? "Bot"}]：${i.data.text}`);
-      else if (i.type === "notice") lines.push(`[平台通知，不是用户发的]：${i.data.text}`);
+      else if (i.type === "notice" && !i.data.local) lines.push(`[平台通知，不是用户发的]：${i.data.text}`);
     }
     const transcript = lines.join("\n\n");
     const clipped = transcript.length > MAX_TRANSCRIPT ? `（更早的内容已省略）\n${transcript.slice(-MAX_TRANSCRIPT)}` : transcript;
@@ -890,6 +998,7 @@ export class Engine {
         // Approvals always reach the conversation the user is watching, however deep the call.
         const from = ctx.callId || ctx.speaker ? { from: l.bot.name } : {};
         const item = this.addItem(ctx.root.convId, l.turnId, "approval", "pending", { title: ev.title, detail: ev.detail, canRemember: ev.canRemember, ...from });
+        this.notify(ctx.root.convId, "approval", `${from.from ? `${from.from}：` : ""}${ev.title}`, item.id);
         l.approvals.set(item.id, ev.requestId);
         this.approvalOwners.set(item.id, l);
         return;
@@ -912,13 +1021,19 @@ export class Engine {
       }
       case "usage": {
         const conv = this.store.getConversation(l.convId)!;
+        // An interrupted Claude turn reports all zeros, though its earlier messages were billed. Zero there means "unknown".
+        const unknown = effectiveTokens(ev) === 0 && l.ticks > 0;
         let costUsd: number | null = null;
-        if (ev.costTotalUsd !== undefined) {
+        if (ev.costTotalUsd !== undefined && !unknown) {
           // Claude reports a running session total, not the cost of this turn.
           costUsd = Math.max(0, ev.costTotalUsd >= conv.cost_total ? ev.costTotalUsd - conv.cost_total : ev.costTotalUsd);
           this.store.updateConversation(l.convId, { cost_total: ev.costTotalUsd });
         }
         l.usage = { inputTokens: ev.inputTokens, cachedTokens: ev.cachedTokens, outputTokens: ev.outputTokens, costUsd };
+        if (unknown) {
+          l.turnTokens = l.ticks;
+          return;
+        }
         l.turnTokens = effectiveTokens(l.usage);
         // Ticks were an estimate during the turn; settle to the exact figure.
         if (ctx) this.spend(ctx.root, l.turnTokens - l.ticks);
@@ -1105,6 +1220,7 @@ export class Engine {
   // Puts a card in front of the user and waits. The tool call stays open until they answer or the turn ends.
   private askUser(l: Live, ctx: TurnCtx, data: Record<string, unknown>) {
     const item = this.addItem(ctx.root.convId, l.turnId, "approval", "pending", data);
+    this.notify(ctx.root.convId, "approval", `${data.from ? `${data.from}：` : ""}${data.title}`, item.id);
     l.approvals.set(item.id, "proposal");
     return new Promise<{ decision: ApprovalDecision | "expired"; spec?: any }>((resolve) => this.proposals.set(item.id, { live: l, resolve }));
   }
@@ -1120,6 +1236,7 @@ export class Engine {
       this.updateItem(e.item_id, { status: e.status, data: { ...cur.data, metrics: e.metrics, notice } });
     }
     if (!e.root_conv_id) return;
+    this.notify(e.root_conv_id, e.status === "done" ? "done" : "failed", `实验 ${e.name} ${statusText[e.status] ?? e.status}`, e.item_id ?? null);
     if (this.research.settings(e.project_id).auto_wake) return this.wake(e.root_conv_id, notice);
     // Nobody is woken, but whoever a group talks to next should still know.
     if (this.store.getConversation(e.root_conv_id)?.kind === "group") this.addItem(e.root_conv_id, null, "notice", "done", { text: notice });
@@ -1131,6 +1248,16 @@ export class Engine {
     if (!conv) return;
     if (conv.status === "running") {
       this.pendingWakes.set(convId, [...(this.pendingWakes.get(convId) ?? []), notice]);
+      return;
+    }
+    // Waking spends tokens the person did not just ask for, so a spent budget ends it. The next message still hears about it.
+    if (this.overBudget(conv.cwd)) {
+      this.addItem(convId, null, "notice", "done", { text: `${notice}（这个项目的预算用完了，没有唤醒 Bot）` });
+      return;
+    }
+    if (this.roundSlotsFull()) {
+      this.pendingWakes.set(convId, [notice, ...(this.pendingWakes.get(convId) ?? [])]);
+      this.slotWaiters.add(convId);
       return;
     }
     const nextStep = "请根据结果决定下一步。需要用户决定的事就直接汇报，不要自行启动大量新实验。";
@@ -1218,7 +1345,9 @@ export class Engine {
     // A question has someone waiting on the answer, so it is told to wait. A task can queue for that Bot.
     const busy = Boolean(child && this.childBusy(child.id));
     if (busy && mode !== "task") return refuse(`${target.name} 正在处理你上一个请求，请先等待结果`, target.name);
-    const queued = deferred || busy;
+    const full = this.callSlotsFull();
+    if (full && mode !== "task") return refuse(`同时运行的 agent 已达全局上限 ${this.store.settings().max_global_active}，请先等待结果`, target.name);
+    const queued = deferred || busy || full;
 
     // Counted before the first await, so parallel calls cannot slip past the limits.
     root.callCount++;
@@ -1255,6 +1384,7 @@ export class Engine {
     const r = await (task ? Promise.race([turn, task.forced]) : turn);
     this.sessionsInUse.delete(child.id);
     ctx.root.activeCalls--;
+    setTimeout(() => this.useFreedSlots(), 0);
     const answer = r.text.length > MAX_ANSWER ? `${r.text.slice(0, MAX_ANSWER)}\n…（回答过长，已截断）` : r.text;
     const completed = r.status === "completed";
     const status = completed ? "done" : task?.timedOut ? "timeout" : r.status;
@@ -1265,6 +1395,7 @@ export class Engine {
     const cur = this.store.getItem(itemId);
     if (cur) this.updateItem(itemId, { status, data: { ...cur.data, answer: shown, tokens: r.tokens } });
     this.broadcast({ type: "trace", convId: ctx.root.convId });
+    if (task && (status === "failed" || status === "timeout")) this.notify(ctx.root.convId, "failed", `${target.name} 的任务${status === "timeout" ? "超时了" : "失败了"}：${firstLine(c.question)}`, itemId);
     this.pumpTasks(ctx.root);
     return { text: shown, isError: !completed };
   }
@@ -1325,7 +1456,7 @@ export class Engine {
         ended = true;
         continue;
       }
-      if (deps.some((d) => d.status !== "done") || root.activeCalls >= maxActive || this.childBusy(t.child.id)) continue;
+      if (deps.some((d) => d.status !== "done") || root.activeCalls >= maxActive || this.childBusy(t.child.id) || this.callSlotsFull()) continue;
       root.activeCalls++;
       this.sessionsInUse.add(t.child.id);
       this.store.startCall(t.callId);
@@ -1462,10 +1593,11 @@ export class Engine {
 
     const open = this.roots.get(conv.id);
     if (!open && conv.status === "running") throw new HttpError(409, "上一轮的结果还在保存，请稍后再试");
+    if (!open) this.checkCanStart(conv.cwd);
     const dependsOn = row.depends_on ? (JSON.parse(row.depends_on as string) as string[]) : [];
     const depRefusal = this.dependencyRefusal(dependsOn, conv.id);
     if (depRefusal) throw new HttpError(409, `${depRefusal}，请先重试它`);
-    const deferred = dependsOn.some((d) => this.store.latestAttempt(d)!.status !== "done");
+    const deferred = dependsOn.some((d) => this.store.latestAttempt(d)!.status !== "done") || this.callSlotsFull();
     const at = { chain, depth: (row.depth as number) - 1 };
     const refusal = this.callRefusal(caller, target, at, open ?? { stopping: false, overBudget: false, callCount: 0, activeCalls: 0 }, deferred);
     if (refusal) throw new HttpError(409, refusal);
@@ -1489,7 +1621,7 @@ export class Engine {
     this.broadcast({ type: "trace", convId: conv.id });
     const ctx: TurnCtx = { root, displayConvId: conv.id, depth: at.depth, chain, callId: parent, callPath: parent ? this.callPath(parent) : [], speaker: null };
     const retryNote = `这是一次重试，上一次的结果：${firstLine(row.reason ?? row.status)}。之前做的可能已经留下了，先确认再继续。`;
-    const task = this.launchTask({ callId, itemId: item.id, callerName: caller.name, ctx, target, child, question: row.question as string, worktree, retryNote }, dependsOn, timeoutMs);
+    const task = this.launchTask({ callId, itemId: item.id, callerName: caller.name, ctx, target, child, question: row.question as string, worktree, retryNote }, dependsOn, timeoutMs, deferred);
     // Whoever asked for this has ended its turn, so the result goes where the next turn will read it.
     if (!open) {
       void task.done.then((r) => {
@@ -1556,6 +1688,7 @@ export class Engine {
       if (open.length) return `等 ${open.map((d) => `${d.to_bot} 完成“${firstLine(d.question)}”`).join("、")}`;
       const root = this.roots.get(r.root_conv_id as string);
       const max = this.store.settings().max_active;
+      if (this.callSlotsFull()) return `等全局并发名额（同时最多 ${this.store.settings().max_global_active} 个）`;
       return root && root.activeCalls >= max ? `等并发名额（同时最多 ${max} 个）` : `等 ${r.to_bot} 忙完手上的事`;
     }
     if (r.status !== "running") return null;

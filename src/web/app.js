@@ -280,6 +280,10 @@ function handleEvent(ev) {
       }
       return;
     }
+    case "notify": {
+      showNotification(ev);
+      return;
+    }
     case "activity": {
       if (ev.convId !== state.convId) return;
       state.activity = ev.activity;
@@ -288,7 +292,10 @@ function handleEvent(ev) {
     }
     case "budget": {
       // A round ending changes what a retry would do, and nothing about the task itself has to change for that.
-      if (!ev.active) refreshTasksPage();
+      if (!ev.active) {
+        refreshTasksPage();
+        void loadBudget();
+      }
       if (ev.convId !== state.convId) return;
       state.trace = { calls: state.trace?.calls ?? [], budget: { spent: ev.spent, limit: ev.limit, active: ev.active } };
       renderDetails();
@@ -404,6 +411,18 @@ async function refreshWorktrees() {
 
 const INBOX_TYPES = ["approval", "queued", "result"];
 let inboxTimer = 0;
+function showNotification(ev) {
+  if (!("Notification" in window) || Notification.permission !== "granted" || document.hasFocus()) return;
+  // The tag keeps several open tabs from showing the same thing twice.
+  const n = new Notification(ev.title, { body: ev.body, tag: `${ev.kind}:${ev.item_id ?? ev.conv_id}` });
+  n.onclick = () => {
+    window.focus();
+    n.close();
+    if (ev.item_id) void jumpToItem({ id: ev.item_id, conv_id: ev.conv_id, bot_id: ev.bot_id, group_id: ev.group_id });
+    else void (ev.group_id ? selectGroup(ev.group_id, ev.conv_id) : selectBot(ev.bot_id, ev.conv_id));
+  };
+}
+
 // What was put off for later does not ask for attention.
 const waitingCount = () => (state.inbox ?? []).filter((i) => i.kind !== "later").length;
 
@@ -417,6 +436,7 @@ async function loadInbox() {
     const before = waitingCount();
     state.inbox = items;
     const changed = waitingCount() !== before;
+    document.title = waitingCount() ? `(${waitingCount()}) Bot Platform` : "Bot Platform";
     if (changed) renderSidebar();
     if (state.view === "inbox") state.page?.update(items);
   } catch {
@@ -1445,6 +1465,78 @@ function traceSection() {
   ];
 }
 
+const tokens = (n) => (n >= 1000 ? compact(n) : String(n));
+const useText = (u) => `${tokens(u.spent)} / ${u.limit ? tokens(u.limit) : "不限"}`;
+
+async function loadBudget() {
+  const entity = currentGroup() ?? currentBot();
+  if (!entity) return;
+  try {
+    const report = await api(`/api/projects/${entity.project_memory}/budget?cwd=${encodeURIComponent(entity.cwd)}`);
+    if ((currentGroup() ?? currentBot()) !== entity) return;
+    state.budget = report;
+    renderDetails();
+  } catch {
+    // The panel keeps what it last showed; the connection banner speaks for itself.
+  }
+}
+
+function budgetSection(entity) {
+  const b = state.budget;
+  if (b?.project_id !== entity.project_memory) {
+    state.budget = null;
+    if (state.budgetFor !== entity.project_memory) {
+      state.budgetFor = entity.project_memory;
+      void loadBudget().finally(() => (state.budgetFor = null));
+    }
+    return [h("h2", { class: "section" }, "项目预算"), h("p", { class: "muted small" }, "读取中…")];
+  }
+  const row = (k, u) => h("div", { class: "kv" }, h("dt", {}, k), h("dd", { class: u.limit && u.spent >= u.limit ? "result-failed" : "" }, useText(u)));
+  return [
+    h("h2", { class: "section" }, "项目预算"),
+    h("dl", {}, row("今天", b.today), row("累计", b.total)),
+    h("button", { type: "button", onclick: () => openBudgetDialog(entity) }, "设置与明细"),
+  ];
+}
+
+function openBudgetDialog(entity) {
+  const b = state.budget;
+  const dlg = $("bot-dialog");
+  const num = (value, label) => h("input", { type: "number", class: "num", min: 0, step: 1000, value: String(value), "aria-label": label });
+  const total = num(b.total.limit, "项目总预算");
+  const daily = num(b.today.limit, "每日预算");
+  const muted = h("input", { type: "checkbox", checked: b.muted ? true : null, "aria-label": "静音这个项目的通知" });
+  const error = h("p", { class: "send-error", role: "alert", hidden: true });
+  const list = (title, rows) => (rows.length ? [h("h3", {}, title), h("ul", { class: "result-files" }, rows.map(([name, n]) => h("li", {}, h("span", { class: "path" }, name), h("span", { class: "spacer" }), h("span", { class: "muted small" }, tokens(n)))))] : []);
+  const save = async () => {
+    try {
+      await api(`/api/projects/${entity.project_memory}/settings`, { method: "PUT", body: { budget_total: Number(total.value), budget_daily: Number(daily.value), muted: muted.checked } });
+      dlg.close();
+      await loadBudget();
+    } catch (e) {
+      error.hidden = false;
+      error.textContent = e.message;
+    }
+  };
+  setChildren(
+    dlg,
+    h(
+      "div",
+      {},
+      h("h2", {}, "项目预算"),
+      h("p", { class: "muted small path" }, entity.cwd),
+      h("p", { class: "muted small" }, "按未缓存的 token 计算，0 表示不限。用完后不再开新一轮，进行中的会停下，排队的消息会留着。Grok 和 Antigravity 要到一轮结束才报用量，可能超出一点才拦下。"),
+      h("div", { class: "budget-form" }, h("label", {}, "总预算", total), h("label", {}, "每日预算", daily), h("label", { class: "check" }, muted, "静音这个项目的通知")),
+      error,
+      h("p", { class: "small" }, `今天 ${useText(b.today)} · 累计 ${useText(b.total)}`),
+      ...list("花费最多的对话", b.by_conversation.map((c) => [c.title, c.tokens])),
+      ...list("花费最多的任务和调用", b.by_call.map((c) => [`${c.owner}：${c.title}`, c.tokens])),
+      h("div", { class: "dialog-actions" }, h("span", { class: "spacer" }), h("button", { type: "button", onclick: () => dlg.close() }, "取消"), h("button", { type: "button", class: "primary", onclick: save }, "保存")),
+    ),
+  );
+  dlg.showModal();
+}
+
 function moduleSection(entity) {
   return [
     h("h2", { class: "section" }, "可选功能"),
@@ -1598,6 +1690,7 @@ function renderDetails() {
       h("dl", { class: "spaced" }, row("每轮预算", `${compact(group.budget_tokens)} tokens`), h("div", { class: "kv stacked" }, h("dt", {}, "共用工作目录"), h("dd", { class: "path", title: group.cwd }, group.cwd))),
       ...worktreeSection(),
       ...memorySection([["项目记忆", "project", group.project_memory, `${group.name} 的项目记忆`]]),
+      ...budgetSection(group),
       ...moduleSection(group),
       ...traceSection(),
     );
@@ -1622,6 +1715,7 @@ function renderDetails() {
     ),
     ...worktreeSection(),
     ...memorySection([["个人记忆", "bot", b.id, `${b.name} 的记忆`], ["项目记忆", "project", b.project_memory, `${b.name} 所在目录的项目记忆`]]),
+    ...budgetSection(b),
     ...moduleSection(b),
     ...traceSection(),
     h("h2", { class: "section" }, "累计用量"),

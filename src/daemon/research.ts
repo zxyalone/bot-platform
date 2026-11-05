@@ -143,6 +143,8 @@ export class Research {
     const columns = (this.db.prepare("PRAGMA table_info(experiments)").all() as Row[]).map((c) => c.name);
     if (!columns.includes("code_hash")) this.db.exec("ALTER TABLE experiments ADD COLUMN code_hash TEXT");
     if (!columns.includes("code_complete")) this.db.exec("ALTER TABLE experiments ADD COLUMN code_complete INTEGER");
+    const project = (this.db.prepare("PRAGMA table_info(project_settings)").all() as Row[]).map((c) => c.name);
+    for (const c of ["budget_total", "budget_daily", "muted"]) if (!project.includes(c)) this.db.exec(`ALTER TABLE project_settings ADD COLUMN ${c} INTEGER NOT NULL DEFAULT 0`);
     this.timer = setInterval(() => void this.poll(), o.pollMs ?? 2000);
     this.timer.unref();
   }
@@ -196,7 +198,7 @@ export class Research {
 
   // ---------- settings ----------
   settings(projectId: string) {
-    return (this.db.prepare("SELECT * FROM project_settings WHERE project_id=?").get(projectId) as Row | undefined) ?? { project_id: projectId, test_dir: "", final_eval_command: "", auto_wake: 1, enabled: 0 };
+    return (this.db.prepare("SELECT * FROM project_settings WHERE project_id=?").get(projectId) as Row | undefined) ?? { project_id: projectId, test_dir: "", final_eval_command: "", auto_wake: 1, enabled: 0, budget_total: 0, budget_daily: 0, muted: 0 };
   }
 
   saveSettings(projectId: string, a: any) {
@@ -206,7 +208,13 @@ export class Research {
     const cmd = a?.final_eval_command === undefined ? cur.final_eval_command : textArg(a.final_eval_command, 4000);
     const wake = a?.auto_wake === undefined ? cur.auto_wake : a.auto_wake ? 1 : 0;
     const enabled = a?.enabled === undefined ? cur.enabled : a.enabled ? 1 : 0;
-    this.db.prepare("INSERT OR REPLACE INTO project_settings (project_id,test_dir,final_eval_command,auto_wake,enabled) VALUES (?,?,?,?,?)").run(projectId, testDir, cmd, wake, enabled);
+    const limit = (key: "budget_total" | "budget_daily") => {
+      if (a?.[key] === undefined) return cur[key];
+      if (!Number.isInteger(a[key]) || a[key] < 0 || a[key] > 1_000_000_000) throw new HttpError(400, "预算需要是 0 到 10 亿之间的整数，0 表示不限");
+      return a[key];
+    };
+    const muted = a?.muted === undefined ? cur.muted : a.muted ? 1 : 0;
+    this.db.prepare("INSERT OR REPLACE INTO project_settings (project_id,test_dir,final_eval_command,auto_wake,enabled,budget_total,budget_daily,muted) VALUES (?,?,?,?,?,?,?,?)").run(projectId, testDir, cmd, wake, enabled, limit("budget_total"), limit("budget_daily"), muted);
     this.notify(projectId);
     return this.settings(projectId);
   }

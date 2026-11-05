@@ -69,6 +69,8 @@ export const SETTING_DEFAULTS = {
   max_depth: 3,
   max_calls: 10,
   max_active: 3,
+  max_global_active: 8,
+  notify_enabled: true,
   task_timeout_minutes: 30,
   low_quota: 20,
   quota_refresh_minutes: 2,
@@ -339,6 +341,22 @@ export class Store {
 
   createRootTurn(id: string, convId: string, budget: number) {
     this.db.prepare("INSERT INTO root_turns (id,conv_id,budget,status,created_at) VALUES (?,?,?,'running',?)").run(id, convId, budget, Date.now());
+  }
+
+  // Written as it is spent, so a crash mid-round cannot make a project look cheaper than it was.
+  setRootSpent(id: string, spent: number) {
+    this.db.prepare("UPDATE root_turns SET spent=? WHERE id=?").run(spent, id);
+  }
+
+  projectSpent(cwd: string, since: number) {
+    return Number((this.db.prepare("SELECT COALESCE(SUM(r.spent),0) n FROM root_turns r JOIN conversations c ON c.id=r.conv_id WHERE c.cwd=? AND r.created_at>=?").get(cwd, since) as Row).n);
+  }
+
+  projectSpending(cwd: string) {
+    return {
+      conversations: this.db.prepare("SELECT c.id, c.title, c.bot_id, c.group_id, SUM(r.spent) tokens FROM root_turns r JOIN conversations c ON c.id=r.conv_id WHERE c.cwd=? GROUP BY c.id HAVING tokens>0 ORDER BY tokens DESC LIMIT 5").all(cwd) as Row[],
+      calls: this.db.prepare("SELECT k.id, k.to_bot, k.question, k.tokens, k.status, k.mode FROM calls k JOIN conversations c ON c.id=k.root_conv_id WHERE c.cwd=? AND k.tokens>0 ORDER BY k.tokens DESC LIMIT 5").all(cwd) as Row[],
+    };
   }
 
   updateRootTurn(id: string, spent: number, status: string) {
