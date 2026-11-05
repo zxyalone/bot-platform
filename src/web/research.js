@@ -101,6 +101,7 @@ export function mountResearch(root, ctx) {
           "td",
           { class: "rs-actions" },
           h("button", { type: "button", onclick: () => showLog(e) }, "日志"),
+          e.status === "running" ? null : h("a", { class: "button", href: `/api/experiments/${e.id}/export`, download: "", title: "代码版本、配置、日志、指标和结果文件。包含测试集结果，分享前请想清楚" }, "打包"),
           e.status === "running" ? h("button", { type: "button", class: "danger", onclick: () => confirm(`取消实验“${e.name}”？`) && act(() => api(`/api/experiments/${e.id}/cancel`, { method: "POST", body: {} })) }, "取消") : null,
           e.status === "done"
             ? h("button", { type: "button", onclick: () => { ui.picked.add(e.id); ui.tab = "results"; draw(); } }, "看结果")

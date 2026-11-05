@@ -7,6 +7,7 @@ import { HttpError } from "./errors.ts";
 import { Memory, Worktrees, type MemoryScope, type Worktree, changedSince, git, workState, type WorkState, diffWithNewFiles, type ChangedFile } from "./git.ts";
 import { Artifacts } from "./artifacts.ts";
 import { Projects } from "./projects.ts";
+import { Exporter } from "./exporter.ts";
 import { Research } from "./research.ts";
 import type { Store } from "./store.ts";
 
@@ -234,6 +235,7 @@ export class Engine {
   private readonly sessionsInUse = new Set<string>();
   readonly artifacts: Artifacts;
   readonly projects: Projects;
+  readonly exporter: Exporter;
   // Conversations with something to send, held back only because no slot is free.
   private readonly slotWaiters = new Set<string>();
   private readonly budgetWarned = new Set<string>();
@@ -257,6 +259,7 @@ export class Engine {
     this.worktrees = new Worktrees(o.store);
     this.research = new Research({ store: o.store, broadcast: o.broadcast, onFinished: (e) => this.onExperimentFinished(e), pollMs: o.pollMs, sshPollMs: o.sshPollMs });
     this.fixedIdleMs = o.idleMs;
+    this.exporter = new Exporter({ store: o.store, memory: this.memory, research: this.research, projects: this.projects });
     this.reaper = setInterval(() => this.reapIdle(), Math.min(o.idleMs ?? 30000, 30000));
     this.reaper.unref();
     for (const convId of this.store.recover()) {
@@ -2079,6 +2082,51 @@ export class Engine {
 
   conversationRunning(rootConvId: string) {
     return this.roots.has(rootConvId);
+  }
+
+  // ---------- archive ----------
+  listArchived() {
+    const db = this.store.db;
+    return {
+      bots: db.prepare("SELECT id, name, agent, model, cwd FROM bots WHERE archived=1 ORDER BY created_at DESC").all(),
+      groups: db.prepare("SELECT id, name, cwd FROM groups WHERE archived=1 ORDER BY created_at DESC").all(),
+      conversations: db
+        .prepare(
+          `SELECT c.id, c.title, c.updated_at, c.bot_id, c.group_id, b.name bot_name, g.name group_name, COALESCE(b.archived, g.archived, 0) owner_archived
+           FROM conversations c LEFT JOIN bots b ON b.id=c.bot_id AND c.kind='direct' LEFT JOIN groups g ON g.id=c.group_id WHERE c.archived=1 AND c.kind IN ('direct','group') ORDER BY c.updated_at DESC LIMIT 200`,
+        )
+        .all(),
+    };
+  }
+
+  restoreConversation(id: string) {
+    // The usual lookup skips archived conversations, which are the only ones this is for.
+    const conv = this.store.db.prepare("SELECT * FROM conversations WHERE id=? AND archived=1").get(id) as unknown as Conversation | undefined;
+    if (!conv || (conv.kind !== "direct" && conv.kind !== "group")) throw new HttpError(404, "没有这个归档的对话");
+    const owner = conv.kind === "group" ? this.store.db.prepare("SELECT archived FROM groups WHERE id=?").get(conv.group_id) : this.store.db.prepare("SELECT archived FROM bots WHERE id=?").get(conv.bot_id);
+    if ((owner as { archived?: number } | undefined)?.archived) throw new HttpError(409, `它所属的${conv.kind === "group" ? "群聊" : " Bot "}还在归档里，请先恢复`);
+    this.store.updateConversation(id, { archived: 0 });
+    this.broadcast({ type: "bots_changed" });
+    return this.store.getConversation(id);
+  }
+
+  restoreBot(id: string) {
+    const db = this.store.db;
+    const row = db.prepare("SELECT name FROM bots WHERE id=? AND archived=1").get(id) as { name: string } | undefined;
+    if (!row) throw new HttpError(404, "没有这个归档的 Bot");
+    if (this.store.listBots().length >= MAX_BOTS) throw new HttpError(409, `Bot 数量已达上限 ${MAX_BOTS}`);
+    if (this.store.listBots().some((b) => b.name.toLowerCase() === row.name.toLowerCase())) throw new HttpError(409, `已经有叫 ${row.name} 的 Bot，请先改名`);
+    db.prepare("UPDATE bots SET archived=0 WHERE id=?").run(id);
+    this.broadcast({ type: "bots_changed" });
+    return this.store.getBot(id);
+  }
+
+  restoreGroup(id: string) {
+    const db = this.store.db;
+    if (!db.prepare("SELECT 1 FROM groups WHERE id=? AND archived=1").get(id)) throw new HttpError(404, "没有这个归档的群聊");
+    db.prepare("UPDATE groups SET archived=0 WHERE id=?").run(id);
+    this.broadcast({ type: "bots_changed" });
+    return this.store.getGroup(id);
   }
 
   archiveBot(botId: string) {

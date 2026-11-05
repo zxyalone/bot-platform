@@ -4,6 +4,8 @@ import { readFile, stat } from "node:fs/promises";
 import { summarize } from "./research.ts";
 import { search } from "./search.ts";
 import { MAX_UPLOAD } from "./artifacts.ts";
+import type { Pack } from "./exporter.ts";
+import { createReadStream, rmSync } from "node:fs";
 import { readQuotas, type QuotaReport } from "./quota.ts";
 import { refineRole, type RefineInput } from "./refine.ts";
 import { CHIEF_ROLE, SETTING_DEFAULTS, type AppSettings } from "./store.ts";
@@ -175,6 +177,18 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
     return true;
   };
 
+  // The pack is a temporary copy, gone once it has been sent or the download is dropped.
+  const sendPack = (res: ServerResponse, pack: Pack, type: string) => {
+    res.writeHead(200, { "content-type": type, "x-content-type-options": "nosniff", "cache-control": "no-store", "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(pack.name)}` });
+    const stream = createReadStream(pack.path);
+    res.on("close", () => {
+      stream.destroy();
+      rmSync(pack.dir, { recursive: true, force: true });
+    });
+    stream.on("error", () => res.destroy());
+    stream.pipe(res);
+  };
+
   const readBytes = (req: IncomingMessage) =>
     new Promise<Buffer>((res, rej) => {
       let size = 0;
@@ -309,6 +323,13 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
       const g = o.store.createGroup(await validateGroup(await readJson(req)));
       broadcast({ type: "group", group: groupView(g) });
       return json(res, 201, groupView(g));
+    }
+    // Ahead of the routes below, which look up what is live and would not find what is archived.
+    if (m === "POST" && parts[3] === "restore" && parts[2]) {
+      await readJson(req);
+      if (parts[1] === "conversations") return json(res, 200, engine.restoreConversation(parts[2]));
+      if (parts[1] === "bots") return json(res, 200, engine.restoreBot(parts[2]));
+      if (parts[1] === "groups") return json(res, 200, engine.restoreGroup(parts[2]));
     }
     if (parts[1] === "groups" && parts[2]) {
       const cur = o.store.getGroup(parts[2]);
@@ -471,6 +492,19 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
         engine.noteMemoryEdited();
         return json(res, 200, { ok: true });
       }
+    }
+    if (m === "GET" && pathname === "/api/archive") return json(res, 200, engine.listArchived());
+    if (m === "GET" && pathname === "/api/backup") return sendPack(res, engine.exporter.databaseBackup(), "application/octet-stream");
+    if (m === "GET" && parts[1] === "conversations" && parts[3] === "export") {
+      const { name, text } = engine.exporter.conversationMarkdown(parts[2]);
+      res.writeHead(200, { "content-type": "text/markdown; charset=utf-8", "x-content-type-options": "nosniff", "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(name)}` });
+      return void res.end(text);
+    }
+    if (m === "GET" && parts[1] === "experiments" && parts[3] === "export") return sendPack(res, await engine.exporter.experimentPack(parts[2]), "application/gzip");
+    if (m === "GET" && parts[1] === "projects" && parts[3] === "backup") {
+      const cwd = new URL(req.url ?? "/", "http://localhost").searchParams.get("cwd") ?? "";
+      if (Memory.projectId(cwd) !== parts[2]) throw new HttpError(400, "工作目录和项目不一致");
+      return sendPack(res, await engine.exporter.projectBackup(cwd), "application/gzip");
     }
     if (m === "GET" && pathname === "/api/projects") return json(res, 200, { projects: engine.projects.list() });
     if (parts[1] === "projects" && parts[2]) {

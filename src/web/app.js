@@ -1911,7 +1911,14 @@ function budgetSection(entity) {
   const row = (k, u) => h("div", { class: "kv" }, h("dt", {}, k), h("dd", { class: u.limit && u.spent >= u.limit ? "result-failed" : "" }, useText(u)));
   return [
     h("h2", { class: "section" }, "项目"),
-    h("div", { class: "project-links" }, h("button", { type: "button", onclick: openProject }, "项目工作台"), h("button", { type: "button", onclick: openArtifacts }, "产物和附件")),
+    h(
+      "div",
+      { class: "project-links" },
+      h("button", { type: "button", onclick: openProject }, "项目工作台"),
+      h("button", { type: "button", onclick: openArtifacts }, "产物和附件"),
+      state.convId ? h("a", { class: "button", href: `/api/conversations/${state.convId}/export`, download: "", title: "这个对话的 Markdown，工具调用只列名称" }, "导出对话") : null,
+      h("a", { class: "button", href: `/api/projects/${entity.project_memory}/backup?cwd=${encodeURIComponent(entity.cwd)}`, download: "", title: "这个项目的对话、任务、记忆、附件和实验记录。不含工作目录，也不能导入回来" }, "备份项目"),
+    ),
     h("h2", { class: "section" }, "项目预算"),
     h("dl", {}, row("今天", b.today), row("累计", b.total)),
     h("button", { type: "button", onclick: () => openBudgetDialog(entity) }, "设置与明细"),

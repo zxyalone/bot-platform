@@ -184,13 +184,54 @@ export function mountSettings(root, ctx) {
     ];
   }
 
+  function archived() {
+    if (!ui.archive) {
+      if (!ui.archiveLoading) {
+        ui.archiveLoading = true;
+        api("/api/archive").then((a) => {
+          ui.archive = a;
+          ui.archiveLoading = false;
+          draw();
+        }, (e) => {
+          ui.archiveLoading = false;
+          ui.error = e.message;
+          draw();
+        });
+      }
+      return group("已归档", row("读取中…", null, null));
+    }
+    const restore = async (path) => {
+      try {
+        ui.error = null;
+        await api(path, { method: "POST", body: {} });
+        ui.archive = null;
+      } catch (e) {
+        ui.error = e.message;
+      }
+      draw();
+    };
+    const line = (label, hint, path, blocked) => row(label, hint, blocked ? h("span", { class: "muted small" }, "先恢复它所属的 Bot 或群聊") : h("button", { type: "button", onclick: () => restore(path) }, "恢复"));
+    const { bots, groups, conversations } = ui.archive;
+    const rows = [
+      ...bots.map((b) => line(b.name, `Bot · ${b.cwd}`, `/api/bots/${b.id}/restore`)),
+      ...groups.map((g) => line(g.name, `群聊 · ${g.cwd}`, `/api/groups/${g.id}/restore`)),
+      ...conversations.map((c) => line(c.title, `对话 · ${c.bot_name ?? c.group_name ?? ""}`, `/api/conversations/${c.id}/restore`, Boolean(c.owner_archived))),
+    ];
+    return group("已归档", rows.length ? rows : row("没有归档的内容", null, null));
+  }
+
   function dataTab() {
     return [
       group(
         "存放位置",
         row("数据目录", "数据库、记忆、工作树和实验结果都在这里", h("code", { class: "path-code" }, ui.data.home)),
       ),
-      h("p", { class: "set-note" }, "归档 Bot 和对话只是隐藏，不会删除数据。"),
+      group(
+        "备份",
+        row("下载数据库", "所有 Bot、对话、任务和设置。恢复方法：停止服务，用它替换数据目录里的 platform.db，再启动。不含记忆、实验文件和工作树", h("a", { class: "button", href: "/api/backup", download: "" }, "下载")),
+      ),
+      archived(),
+      h("p", { class: "set-note" }, "归档只是隐藏，不会删除数据。单个项目的备份和对话导出在右侧面板。"),
     ];
   }
 
