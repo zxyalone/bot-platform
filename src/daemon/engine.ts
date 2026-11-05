@@ -32,6 +32,8 @@ const pick = (o: any) => Object.fromEntries(PROPOSAL_FIELDS.filter((k) => o?.[k]
 interface RootTurn {
   // The person's message that opened this round, if one did.
   requestItem?: string;
+  // The round itself failed. A task failing inside a round that went on does not count.
+  failed?: boolean;
   id: string;
   convId: string;
   limit: number;
@@ -308,7 +310,7 @@ export class Engine {
     if (root.activityTimer) clearTimeout(root.activityTimer);
     root.activityTimer = null;
     this.publish({ type: "activity", convId: root.convId, activity: null });
-    const status = root.overBudget ? "over_budget" : root.stopping ? "interrupted" : "completed";
+    const status = root.overBudget ? "over_budget" : root.stopping ? "interrupted" : root.failed ? "failed" : "completed";
     this.store.updateRootTurn(root.id, root.spent, status);
     this.broadcastBudget(root, false);
     this.setConversation(root.convId, { status: "idle" });
@@ -929,7 +931,10 @@ export class Engine {
   }
 
   private finishTurn(ctx: TurnCtx, turnId: string, status: TurnStatus, error?: string, usage?: Live["usage"], started?: number) {
-    if (status === "failed") this.addItem(ctx.displayConvId, turnId, "error", "done", { message: error ?? "这一轮失败了", ...this.speakerData(ctx), ...this.failedStep(ctx) });
+    if (status === "failed") {
+      if (!ctx.callId) ctx.root.failed = true;
+      this.addItem(ctx.displayConvId, turnId, "error", "done", { message: error ?? "这一轮失败了", ...this.speakerData(ctx), ...this.failedStep(ctx) });
+    }
     this.addItem(ctx.displayConvId, turnId, "turn_summary", status, { ...(usage ?? {}), ms: started ? Date.now() - started : undefined, ...this.speakerData(ctx) });
   }
 
@@ -1382,6 +1387,8 @@ export class Engine {
     if (!open) {
       void task.done.then((r) => {
         const after = this.store.getCall(callId)!;
+        // This task is all the round there was.
+        if (after.status !== "done") root.failed = true;
         this.addItem(conv.id, null, "notice", "done", { text: `重试的任务（${after.from_bot} → ${after.to_bot}，task_id ${callId}）${OUTCOME[after.status as string] ?? after.status}：${clip(r.text, NOTICE_ANSWER)}` });
         this.closeRoot(root);
       });

@@ -298,6 +298,53 @@ test("a Bot with nothing on record is not credited with any work", async () => {
   s.t.close();
 });
 
+// ---------- the result card ----------
+test("the result card of a failed round says it failed, not that it completed", async () => {
+  const s = await setup();
+  const cwd = repo();
+  const a = await s.newBot("Writer", cwd);
+  const card = async (conv: string) => {
+    await s.t.waitFor(async () => (await s.items(conv)).some((i) => i.type === "result"), "result card");
+    return (await s.items(conv)).findLast((i) => i.type === "result");
+  };
+  const bad = await s.start("改", a);
+  writeFileSync(join(cwd, "a.py"), "2\n");
+  bad.f.fail();
+  await s.idle(bad.conv);
+  assert.equal((await card(bad.conv)).status, "failed");
+  assert.equal(s.t.store.latestRootTurn(bad.conv)!.status, "failed");
+
+  const good = await s.start("再改", a);
+  writeFileSync(join(cwd, "a.py"), "3\n");
+  good.f.reply();
+  await s.idle(good.conv);
+  assert.equal((await card(good.conv)).status, "completed", "a new round starts clean");
+  s.t.close();
+});
+
+test("a task failing does not fail a round that went on; a retried task on its own round does", async () => {
+  const s = await setup();
+  await s.newBot("B");
+  const cwd = repo();
+  const a = await s.newBot("Writer", cwd);
+  const { conv, f } = await s.start("派活", a);
+  const task = JSON.parse(((await (await fetch(`${s.t.base}/internal/bus`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${f.opts.bus!.env.BUS_TOKEN}` }, body: JSON.stringify({ tool: "assign_task", args: { bot: "B", task: "查" } }) })).json()) as { text: string }).text);
+  const child = await s.sentTo(/查/);
+  child.fail("炸了");
+  await s.t.waitFor(() => s.t.store.getCall(task.task_id)!.status === "failed", "task failed");
+  writeFileSync(join(cwd, "a.py"), "2\n");
+  f.reply();
+  await s.idle(conv);
+  assert.equal(s.t.store.latestRootTurn(conv)!.status, "completed");
+
+  assert.equal((await s.t.api("POST", `/api/tasks/${task.task_id}/retry`, {})).status, 202);
+  await s.t.waitFor(() => child.sent.length === 2, "second attempt");
+  child.fail("又炸了");
+  await s.idle(conv);
+  assert.equal(s.t.store.latestRootTurn(conv)!.status, "failed");
+  s.t.close();
+});
+
 // ---------- inbox ----------
 test("the inbox lists pending approvals, unsent messages and unaccepted results until each is dealt with", async () => {
   const s = await setup();
