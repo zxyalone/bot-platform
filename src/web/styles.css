@@ -416,6 +416,13 @@ a.button { display: inline-flex; align-items: center; padding: 4px 10px; border:
 .project-section .link-btn { border: 0; background: transparent; padding: 0; color: var(--accent-text); text-align: left; overflow-wrap: anywhere; }
 .project-section .link-btn:hover { text-decoration: underline; background: transparent; }
 .project-links { display: flex; flex-wrap: wrap; gap: 6px; }
+.plan-step { display: grid; gap: 6px; padding: 8px 0; border-top: 1px solid var(--line); }
+.plan-step textarea, .plan-step input:not([type="checkbox"]), .plan-card > input { width: 100%; font-size: 0.84rem; }
+.plan-step-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.84rem; }
+.plan-step-head button { padding: 1px 7px; font-size: 0.76rem; }
+.plan-deps { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 0.8rem; }
+.plan-list { margin: 0; padding-left: 20px; display: grid; gap: 4px; font-size: 0.85rem; }
+.plan-list p { margin: 2px 0 0; }
 .module-row { display: flex; gap: 10px; align-items: flex-start; font-size: 0.85rem; }
 .module-row > span { flex: 1; }
 .module-row button { padding: 2px 10px; font-size: 0.82rem; flex: none; }

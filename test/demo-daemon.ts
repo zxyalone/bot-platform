@@ -15,7 +15,7 @@ const port = Number(process.env.PORT || 4317);
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let scoutRuns = 0;
 
-function bus(o: RuntimeOptions, tool: string, args: unknown): Promise<{ text: string }> {
+function bus(o: RuntimeOptions, tool: string, args: unknown): Promise<{ text: string; isError?: boolean }> {
   const body = JSON.stringify({ tool, args });
   return new Promise((resolve) => {
     const req = http.request({ host: "127.0.0.1", port, path: "/internal/bus", method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${o.bus!.env.BUS_TOKEN}` } }, (res) => {
@@ -68,7 +68,15 @@ class Scripted implements AgentRuntime {
     } else if (/^接手 /.test(prompt)) {
       await this.stream("我先看看现状，确认上一位做到哪了，再接着做。这是脚本回复，没有消耗额度。");
     } else if (name === "Chief") {
-      if (/会失败/.test(prompt) && !/重试上一步/.test(prompt)) {
+      if (/计划/.test(prompt)) {
+        await this.stream("这件事步骤比较多，我先列个计划给你确认。");
+        const r = await bus(this.o, "propose_plan", { title: "加上边界损失并通过审查", tasks: [{ id: "write", bot: "Engineer", task: "按审查标准写 boundary_loss.py", acceptance: "有单元测试" }, { id: "review", bot: "Reviewer", task: "后台审查 boundary_loss.py", acceptance: "列出严重问题", depends_on: ["write"] }] });
+        if (r.isError) await this.stream(`好的。${r.text}`);
+        else {
+          for (const t of JSON.parse(r.text).tasks) if (t.task_id) await bus(this.o, "get_task", { task_id: t.task_id, wait_seconds: 30 });
+          await this.stream("计划的步骤都做完了。");
+        }
+      } else if (/会失败/.test(prompt) && !/重试上一步/.test(prompt)) {
         // Fails after leaving a change behind, and works when retried, so all three recovery buttons can be tried.
         await this.stream("我先改一个文件，再跑后面的步骤。");
         writeFileSync(join(this.o.cwd, "half_done.py"), "# 只写了一半\n");

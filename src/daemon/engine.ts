@@ -22,6 +22,7 @@ const MAX_BOTS = 12;
 export const STEERABLE: AgentKind[] = ["claude", "codex"];
 const MAX_QUEUED = 10;
 const MAX_COMPARED = 6;
+const MAX_PLAN_STEPS = 12;
 const COMPARE_ANSWER = 12000;
 const COMPARE_ITEMS = 12;
 const BUDGET_WARN_AT = 0.8;
@@ -40,6 +41,15 @@ const PERMISSION_TEXT: Record<string, string> = { ask: "每次询问", auto_edit
 const pick = (o: any) => Object.fromEntries(PROPOSAL_FIELDS.filter((k) => o?.[k] !== undefined).map((k) => [k, o[k]]));
 
 // Everything started by one user message: the budget and limits span the whole call tree.
+interface PlanStep {
+  id: string;
+  bot: string;
+  task: string;
+  acceptance: string;
+  depends_on: string[];
+  isolated: boolean;
+}
+
 interface RootTurn {
   // The person's message that opened this round, if one did.
   requestItem?: string;
@@ -1394,9 +1404,89 @@ export class Engine {
       case "pause_bot":
         if (!l.bot.is_chief) return { text: "只有 Chief 可以管理 Bot", isError: true };
         return this.manageBot(l, ctx, tool, args);
+      case "propose_plan":
+        if (!l.bot.is_chief) return { text: "只有 Chief 可以提出执行计划", isError: true };
+        return this.proposePlan(l, ctx, args);
       default:
         return { text: `没有工具 ${tool}`, isError: true };
     }
+  }
+
+  // ---------- plans the person can edit before anything runs ----------
+  // Checked for Chief's draft and again for the person's edits. Returns the steps in an order that can start.
+  private checkPlan(raw: unknown, caller: Bot, root: RootTurn): PlanStep[] {
+    if (!Array.isArray(raw) || !raw.length) throw new HttpError(400, "计划至少要有一步");
+    if (raw.length > MAX_PLAN_STEPS) throw new HttpError(400, `计划最多 ${MAX_PLAN_STEPS} 步`);
+    const room = this.store.settings().max_calls - root.callCount;
+    if (raw.length > room) throw new HttpError(400, `这一轮最多还能派 ${room} 个任务，计划有 ${raw.length} 步。可以减少步骤，或者在设置里调高单轮调用次数`);
+    const steps: PlanStep[] = raw.map((s: any, i: number) => ({
+      id: typeof s?.id === "string" && s.id.trim() ? s.id.trim().slice(0, 60) : `step${i + 1}`,
+      bot: String(s?.bot ?? "").trim(),
+      task: typeof s?.task === "string" ? s.task.trim().slice(0, 8000) : "",
+      acceptance: typeof s?.acceptance === "string" ? s.acceptance.trim().slice(0, 2000) : "",
+      depends_on: Array.isArray(s?.depends_on) ? [...new Set(s.depends_on.map(String))] as string[] : [],
+      isolated: s?.isolated === true,
+    }));
+    const ids = new Set(steps.map((s) => s.id));
+    if (ids.size !== steps.length) throw new HttpError(400, "步骤的 id 不能重复");
+    const bots = this.store.listBots();
+    // Numbers, because the person's card shows numbers and a step they added has only a generated id.
+    const name = (id: string) => `第 ${steps.findIndex((x) => x.id === id) + 1} 步`;
+    for (const s of steps) {
+      if (!s.task) throw new HttpError(400, `${name(s.id)}没有写要做什么`);
+      const target = bots.find((b) => b.name.toLowerCase() === s.bot.toLowerCase());
+      if (!target) throw new HttpError(400, `${name(s.id)}的负责人 ${s.bot || "（空）"} 不存在`);
+      if (target.id === caller.id) throw new HttpError(400, `${name(s.id)}不能派给 ${caller.name} 自己`);
+      if (target.paused) throw new HttpError(400, `${name(s.id)}的负责人 ${target.name} 已被暂停`);
+      s.bot = target.name;
+      const missing = s.depends_on.find((d) => !ids.has(d));
+      if (missing) throw new HttpError(400, `${name(s.id)}依赖的 ${missing} 不在计划里`);
+    }
+    const ordered: PlanStep[] = [];
+    const placed = new Set<string>();
+    while (ordered.length < steps.length) {
+      const next = steps.find((s) => !placed.has(s.id) && s.depends_on.every((d) => placed.has(d)));
+      if (!next) throw new HttpError(400, "步骤之间的依赖成环了，这样哪一步都开始不了");
+      ordered.push(next);
+      placed.add(next.id);
+    }
+    return ordered;
+  }
+
+  private async proposePlan(l: Live, ctx: TurnCtx, args: any): Promise<CallResult> {
+    let steps: PlanStep[];
+    try {
+      steps = this.checkPlan(args?.tasks, l.bot, ctx.root);
+    } catch (e) {
+      return { text: (e as Error).message, isError: true };
+    }
+    const planTitle = typeof args?.title === "string" && args.title.trim() ? clip(args.title.trim(), 200) : "执行计划";
+    const answer = await this.askUser(l, ctx, { kind: "plan", title: `执行计划：${planTitle}`, detail: "", canRemember: false, from: l.bot.name, tasks: steps });
+    if (answer.decision === "expired") return { text: "这个计划已失效", isError: true };
+    if (answer.decision === "deny") return { text: answer.spec?.feedback ? `用户要求修改计划：${answer.spec.feedback}\n按这个意见改好后，再用 propose_plan 提交。还没有派出任何任务。` : "用户拒绝了这个计划，没有派出任何任务。不要继续执行它，向用户说明即可。", isError: true };
+
+    // In dependency order, so each step's task id exists by the time something needs it.
+    const taskIds = new Map<string, string>();
+    const out: Record<string, unknown>[] = [];
+    for (const s of answer.spec.tasks as PlanStep[]) {
+      const lost = s.depends_on.find((d) => !taskIds.has(d));
+      if (lost) {
+        out.push({ id: s.id, bot: s.bot, status: "refused", reason: `依赖的 ${lost} 没能派出` });
+        continue;
+      }
+      const dependsOn = s.depends_on.map((d) => taskIds.get(d)!);
+      const timeoutMs = this.taskTimeout(NaN);
+      const body = s.acceptance ? `${s.task}\n\n验收条件（用户确认过）：\n${s.acceptance}\n\n做完后逐条说明是否满足，不满足的直接说。` : s.task;
+      const prepared = await this.prepareCall(l, ctx, s.bot, body, "task", { isolated: s.isolated, dependsOn, timeoutMs });
+      if ("refused" in prepared) {
+        out.push({ id: s.id, bot: s.bot, status: "refused", reason: prepared.refused });
+        continue;
+      }
+      this.launchTask({ callId: prepared.callId, itemId: prepared.itemId, callerName: l.bot.name, ctx, target: prepared.target, child: prepared.child, question: body, worktree: prepared.worktree }, dependsOn, timeoutMs, prepared.queued);
+      taskIds.set(s.id, prepared.callId);
+      out.push({ id: s.id, bot: s.bot, task_id: prepared.callId, status: this.store.getCall(prepared.callId)!.status, acceptance: s.acceptance });
+    }
+    return { text: JSON.stringify({ status: "approved", tasks: out, note: "用户可能改过负责人和要求，以这里为准。结束本轮前用 get_task 取回每一步的结果，再逐条核对验收条件后汇报。" }), isError: false };
   }
 
   // Chief can only propose: nothing changes until the user approves the card.
@@ -1935,6 +2025,16 @@ export class Engine {
     const proposal = this.proposals.get(itemId);
     if (proposal) {
       if (decision === "allow_session") throw new HttpError(400, "这个提议只能批准或拒绝");
+      if (item.data.kind === "plan") {
+        const root = proposal.live.ctx?.root;
+        // A mistake in the person's edits comes back to the card, which stays open.
+        const tasks = decision === "allow" && root ? this.checkPlan((spec as any)?.tasks ?? item.data.tasks, proposal.live.bot, root) : (item.data.tasks as PlanStep[]);
+        const feedback = decision === "deny" && typeof (spec as any)?.feedback === "string" ? clip((spec as any).feedback.trim(), 2000) : "";
+        this.proposals.delete(itemId);
+        proposal.live.approvals.delete(itemId);
+        proposal.resolve({ decision, spec: { tasks, feedback } });
+        return this.updateItem(itemId, { status: decision === "deny" ? "denied" : "allowed", data: { ...item.data, tasks, feedback } });
+      }
       const edited = spec && item.data.kind === "bot_proposal" ? pick(spec) : undefined;
       // An edited proposal is checked now, so a mistake comes back to the person editing it.
       if (edited && decision === "allow") await this.validateBot(edited, item.data.existingId ? this.store.getBot(String(item.data.existingId)) : undefined);

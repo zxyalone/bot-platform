@@ -67,6 +67,32 @@ const tools = [
   { name: "get_experiment", description: "查看单个实验的状态、指标和日志结尾。", inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
   { name: "create_bot", description: "提议新建 Bot。会等用户批准后才返回。", inputSchema: { type: "object", properties: spec, required: ["name", "role", "agent", "model"] } },
   { name: "update_bot", description: "提议修改某个 Bot，只传要改的字段。会等用户批准后才返回。", inputSchema: { type: "object", properties: { bot, ...spec }, required: ["bot"] } },
+  {
+    name: "propose_plan",
+    description: "把复杂任务的执行计划交给用户确认。步骤有 3 个以上、有依赖，或者会改很多文件时用它；简单任务不要用，直接做。用户可以改负责人、顺序、依赖和验收条件，也可以要求你重写。会等用户决定后才返回。批准后平台按依赖派出任务并返回每步的 task_id，你要用 get_task 取回结果，再逐条核对验收条件。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "这个计划要做成什么，一句话" },
+        tasks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "这一步的简短标识，depends_on 用它" },
+              bot: { type: "string", description: "负责这一步的 Bot" },
+              task: { type: "string", description: "要做什么。对方看不到用户的原话，要写清背景和要求" },
+              acceptance: { type: "string", description: "怎么算做完，要能核对" },
+              depends_on: { type: "array", items: { type: "string" }, description: "要先完成的步骤的 id。没有依赖的步骤会同时开始" },
+              isolated: { type: "boolean", description: "写代码的步骤传 true，放进独立的 Git 工作树" },
+            },
+            required: ["id", "bot", "task"],
+          },
+        },
+      },
+      required: ["title", "tasks"],
+    },
+  },
   { name: "pause_bot", description: "暂停某个 Bot，暂停后其他 Bot 不能调用它。只有用户能恢复。", inputSchema: { type: "object", properties: { bot }, required: ["bot"] } },
   {
     name: "get_task",

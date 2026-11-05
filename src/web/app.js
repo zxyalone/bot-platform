@@ -1404,6 +1404,97 @@ function openCompareDialog() {
   dlg.showModal();
 }
 
+// What the person has changed so far, kept across redraws of the card.
+const planDrafts = new Map();
+
+function planNode(item, attrs) {
+  const d = item.data;
+  const pending = item.status === "pending";
+  if (!pending) {
+    planDrafts.delete(item.id);
+    const label = { allowed: "计划已批准，任务已派出", denied: d.feedback ? "已要求修改计划" : "计划被拒绝", expired: "计划已失效" }[item.status] ?? item.status;
+    return h(
+      "div",
+      { ...attrs, class: `result-card plan-card ${item.status}` },
+      h("div", { class: "result-head" }, h("strong", {}, label), h("span", { class: "muted small" }, d.title)),
+      d.feedback ? h("p", { class: "small" }, `你的意见：${d.feedback}`) : null,
+      h(
+        "ol",
+        { class: "plan-list" },
+        d.tasks.map((t) => h("li", {}, h("strong", {}, `${t.bot}：`), t.task.split("\n")[0], t.acceptance ? h("p", { class: "muted small" }, `验收：${t.acceptance}`) : null, t.depends_on.length ? h("p", { class: "muted small" }, `等第 ${t.depends_on.map((id) => d.tasks.findIndex((x) => x.id === id) + 1).join("、")} 步完成后开始`) : null)),
+      ),
+    );
+  }
+  if (!planDrafts.has(item.id)) planDrafts.set(item.id, { tasks: d.tasks.map((t) => ({ ...t, depends_on: [...t.depends_on] })), feedback: "", error: null });
+  const draft = planDrafts.get(item.id);
+  const redraw = () => replaceItemNode(item);
+  const owners = state.bots.filter((b) => !b.paused && b.name !== d.from);
+  const step = (t, i) => {
+    const owner = h("select", { "aria-label": "负责人", onchange: (e) => (t.bot = e.target.value) }, owners.map((b) => h("option", { value: b.name }, b.name)));
+    owner.value = t.bot;
+    const task = h("textarea", { rows: 3, "aria-label": "要做什么", oninput: (e) => (t.task = e.target.value) });
+    task.value = t.task;
+    const others = draft.tasks.filter((x) => x !== t);
+    return h(
+      "div",
+      { class: "plan-step" },
+      h(
+        "div",
+        { class: "plan-step-head" },
+        h("strong", {}, `第 ${i + 1} 步`),
+        owner,
+        h("label", { class: "check", title: "放进独立的 Git 工作树，改动要你合并后才进主目录" }, h("input", { type: "checkbox", checked: t.isolated ? true : null, onchange: (e) => (t.isolated = e.target.checked) }), "工作树"),
+        h("span", { class: "spacer" }),
+        h("button", { type: "button", "aria-label": "上移", disabled: i === 0 ? true : null, onclick: () => { draft.tasks.splice(i - 1, 0, draft.tasks.splice(i, 1)[0]); redraw(); } }, "↑"),
+        h("button", { type: "button", "aria-label": "下移", disabled: i === draft.tasks.length - 1 ? true : null, onclick: () => { draft.tasks.splice(i + 1, 0, draft.tasks.splice(i, 1)[0]); redraw(); } }, "↓"),
+        h("button", { type: "button", class: "danger", disabled: draft.tasks.length === 1 ? true : null, onclick: () => { draft.tasks.splice(i, 1); for (const x of draft.tasks) x.depends_on = x.depends_on.filter((id) => id !== t.id); redraw(); } }, "删除"),
+      ),
+      task,
+      h("input", { value: t.acceptance, placeholder: "验收条件：怎么算做完（可不填）", "aria-label": "验收条件", oninput: (e) => (t.acceptance = e.target.value) }),
+      others.length
+        ? h(
+            "div",
+            { class: "plan-deps" },
+            h("span", { class: "muted small" }, "等这些做完："),
+            others.map((x) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: t.depends_on.includes(x.id) ? true : null, onchange: (e) => { t.depends_on = e.target.checked ? [...t.depends_on, x.id] : t.depends_on.filter((id) => id !== x.id); } }), `第 ${draft.tasks.indexOf(x) + 1} 步`)),
+          )
+        : null,
+    );
+  };
+  const decide = async (decision, spec) => {
+    try {
+      await api(`/api/approvals/${item.id}`, { method: "POST", body: { decision, spec } });
+    } catch (e) {
+      draft.error = e.message;
+      redraw();
+    }
+  };
+  const feedback = h("input", { value: draft.feedback, placeholder: "想让 Chief 怎么改（可不填）", "aria-label": "修改意见", oninput: (e) => (draft.feedback = e.target.value) });
+  return h(
+    "div",
+    { ...attrs, class: "result-card plan-card pending" },
+    h("div", { class: "result-head" }, h("strong", {}, `${d.from} 的计划，确认后才开始`)),
+    h("p", { class: "small" }, d.title.replace(/^执行计划：/, "")),
+    h("p", { class: "muted small" }, "顺序只影响显示，什么时候开始看依赖：没有依赖的步骤会同时开始。"),
+    draft.tasks.map(step),
+    draft.error ? h("p", { class: "send-error", role: "alert" }, draft.error) : null,
+    h(
+      "div",
+      { class: "approval-actions" },
+      h("button", { type: "button", onclick: () => { draft.tasks.push({ id: `step-${Date.now()}`, bot: owners[0]?.name ?? "", task: "", acceptance: "", depends_on: [], isolated: false }); redraw(); } }, "添加一步"),
+      h("button", { type: "button", title: "让每一步都等上一步做完", onclick: () => { draft.tasks.forEach((t, i) => (t.depends_on = i ? [draft.tasks[i - 1].id] : [])); redraw(); } }, "依次执行"),
+    ),
+    feedback,
+    h(
+      "div",
+      { class: "approval-actions" },
+      h("button", { type: "button", class: "primary", onclick: () => decide("allow", { tasks: draft.tasks }) }, "批准并开始"),
+      h("button", { type: "button", onclick: () => decide("deny", { feedback: draft.feedback || "请重新考虑这个计划" }) }, "要求修改"),
+      h("button", { type: "button", class: "danger", onclick: () => decide("deny", {}) }, "拒绝"),
+    ),
+  );
+}
+
 function resultNode(item, attrs) {
   const d = item.data;
   const ended = { completed: "这一轮完成了", failed: "这一轮失败了", interrupted: "这一轮被停止了", over_budget: "这一轮预算用完了" }[item.status] ?? "这一轮结束了";
@@ -1608,6 +1699,7 @@ function itemNode(item) {
       );
     }
     case "approval": {
+      if (d.kind === "plan") return planNode(item, attrs);
       const pending = item.status === "pending";
       return h(
         "div",

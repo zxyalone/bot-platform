@@ -112,4 +112,4 @@ export const MODELS: Record<AgentKind, string[]> = {
 
 export const BUS_TOOLS = ["list_bots", "ask_bot", "assign_task", "get_task", "remember", "recall"];
 export const RESEARCH_TOOLS = ["add_idea", "update_idea", "list_ideas", "run_experiment", "list_experiments", "get_experiment"];
-export const CHIEF_TOOLS = ["create_bot", "update_bot", "pause_bot"];
+export const CHIEF_TOOLS = ["create_bot", "update_bot", "pause_bot", "propose_plan"];
