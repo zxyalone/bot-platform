@@ -146,7 +146,7 @@ export class Store {
     try {
       // Claude Code files its sessions under the directory they started in, so these cannot resume from the new one.
       this.db.prepare("UPDATE conversations SET session_id=NULL WHERE agent='claude' AND (cwd=? OR substr(cwd,1,?)=?)").run(old, old.length + 1, `${old}/`);
-      const targets: [string, string][] = [["bots", "cwd"], ["conversations", "cwd"], ["groups", "cwd"], ["worktrees", "path"], ["experiments", "cwd"], ["jobs", "dir"]];
+      const targets: [string, string][] = [["bots", "cwd"], ["conversations", "cwd"], ["groups", "cwd"], ["worktrees", "path"], ["experiments", "cwd"], ["jobs", "dir"], ["artifacts", "path"], ["artifacts", "root"], ["artifacts", "project_cwd"]];
       for (const [t, c] of targets) {
         if (!hasTable(t)) continue;
         this.db.prepare(`UPDATE ${t} SET ${c} = ? || substr(${c}, ?) WHERE ${c} = ? OR substr(${c}, 1, ?) = ?`).run(this.home, old.length + 1, old, old.length + 1, `${old}/`);

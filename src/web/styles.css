@@ -382,6 +382,19 @@ summary::-webkit-details-marker { display: none; }
 .memory-links button { padding: 2px 10px; font-size: 0.82rem; }
 .budget-form { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 8px 0; font-size: 0.85rem; }
 .budget-form label { display: flex; align-items: center; gap: 6px; }
+.file-strip { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.file-strip[hidden] { display: none; }
+.file-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 0.78rem; color: var(--text); overflow-wrap: anywhere; }
+.file-chip.failed { border-color: var(--danger); }
+.file-chip img { width: 36px; height: 36px; object-fit: cover; border-radius: 4px; }
+.chip-x { border: 0; background: transparent; padding: 0 2px; color: var(--muted); }
+.msg-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.composer.dropping { border-color: var(--accent); }
+.attach-btn { flex: none; align-self: flex-end; }
+.artifact-preview img { max-width: 100%; max-height: 60vh; display: block; margin: 0 auto; }
+.artifact-preview .diff-view { max-height: 60vh; overflow: auto; }
+.artifact-row .path { overflow-wrap: anywhere; margin: 0; }
+a.button { display: inline-flex; align-items: center; padding: 4px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); text-decoration: none; font-size: 0.82rem; }
 .module-row { display: flex; gap: 10px; align-items: flex-start; font-size: 0.85rem; }
 .module-row > span { flex: 1; }
 .module-row button { padding: 2px 10px; font-size: 0.82rem; flex: none; }

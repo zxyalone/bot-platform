@@ -6,6 +6,7 @@ import { mountSettings } from "./settings.js";
 import { mountTasks, TASK_STATUS } from "./tasks.js";
 import { mountInbox } from "./inbox.js";
 import { mountSearch } from "./search.js";
+import { mountArtifacts, previewArtifact } from "./artifacts.js";
 import { draftKey as keyFor, loadDrafts, saveDrafts } from "./drafts.js";
 
 const AGENT_LABEL = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", antigravity: "Antigravity" };
@@ -36,6 +37,9 @@ const draftStorage = (() => {
     return undefined;
   }
 })();
+
+// Must match the daemon, which puts this between what was typed and the paths meant for the agent.
+const ATTACH_MARK = "[用户附带的文件，路径相对工作目录，需要时用工具读取]";
 
 const state = {
   settings: null,
@@ -500,12 +504,14 @@ async function send() {
   const text = box.value;
   const group = currentGroup();
   const bot = currentBot();
-  if (!text.trim() || !(bot || group) || state.sending) return;
+  if ((!text.trim() && !readyFiles().length) || !(bot || group) || state.sending) return;
+  if (uploadPending()) return blockForUpload();
   state.sending = true;
   state.sendError = null;
   renderComposerState();
   try {
-    const conv = await api(group ? `/api/groups/${group.id}/messages` : `/api/bots/${bot.id}/messages`, { method: "POST", body: { text, conversationId: state.convId } });
+    const conv = await api(group ? `/api/groups/${group.id}/messages` : `/api/bots/${bot.id}/messages`, { method: "POST", body: { text, conversationId: state.convId, attachments: readyFiles().map((f) => f.id) } });
+    clearFiles();
     state.drafts.delete(draftKey());
     box.value = "";
     autoGrow(box);
@@ -532,12 +538,14 @@ async function send() {
 async function followUp(mode) {
   const box = $("composer-input");
   const text = box.value;
-  if (!text.trim() || !state.convId || state.sending) return;
+  if ((!text.trim() && !readyFiles().length) || !state.convId || state.sending) return;
+  if (uploadPending()) return blockForUpload();
   state.sending = true;
   state.sendError = null;
   renderComposerState();
   try {
-    const r = await api(`/api/conversations/${state.convId}/followup`, { method: "POST", body: { text, mode } });
+    const r = await api(`/api/conversations/${state.convId}/followup`, { method: "POST", body: { text, mode, attachments: readyFiles().map((f) => f.id) } });
+    clearFiles();
     state.drafts.delete(draftKey());
     box.value = "";
     autoGrow(box);
@@ -548,6 +556,56 @@ async function followUp(mode) {
   state.sending = false;
   renderComposerState();
   box.focus();
+}
+
+// ---------- files on their way into a message ----------
+const pendingFiles = new Map();
+const filesHere = () => pendingFiles.get(draftKey()) ?? [];
+const readyFiles = () => filesHere().filter((f) => f.id);
+const uploadPending = () => filesHere().some((f) => f.uploading);
+function clearFiles() {
+  pendingFiles.delete(draftKey());
+  renderFiles();
+}
+function blockForUpload() {
+  state.sendError = "文件还在上传，传完再发";
+  renderComposerState();
+}
+
+async function addFiles(list) {
+  const key = draftKey();
+  for (const file of list) {
+    const entry = { name: file.name, size: file.size, uploading: true };
+    pendingFiles.set(key, [...(pendingFiles.get(key) ?? []), entry]);
+    renderFiles();
+    try {
+      const res = await fetch(`/api/uploads?name=${encodeURIComponent(file.name)}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: file });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `上传失败（${res.status}）`);
+      Object.assign(entry, data, { uploading: false });
+    } catch (e) {
+      Object.assign(entry, { uploading: false, error: e.message });
+    }
+    renderFiles();
+  }
+}
+
+function renderFiles() {
+  const strip = $("file-strip");
+  if (!strip) return;
+  const list = filesHere();
+  strip.hidden = !list.length;
+  strip.replaceChildren(
+    ...list.map((f) =>
+      h(
+        "span",
+        { class: `file-chip${f.error ? " failed" : ""}`, title: f.error ?? "" },
+        f.name,
+        h("span", { class: "muted small" }, f.uploading ? "上传中…" : f.error ? "失败" : ""),
+        h("button", { type: "button", class: "chip-x", "aria-label": `移除 ${f.name}`, onclick: () => { pendingFiles.set(draftKey(), filesHere().filter((x) => x !== f)); renderFiles(); } }, "×"),
+      ),
+    ),
+  );
 }
 
 async function withdrawQueued(item) {
@@ -799,6 +857,29 @@ async function jumpToItem(entry) {
   setTimeout(() => node.classList.remove("item-flash"), 2000);
 }
 
+function openArtifacts() {
+  saveDraft();
+  const entity = currentEntity();
+  if (!entity) return;
+  state.view = "artifacts";
+  state.sidebarOpen = false;
+  $("app").classList.remove("sidebar-open");
+  $("app").classList.add("full-page");
+  state.page = mountArtifacts($("main"), {
+    api,
+    h,
+    cwd: entity.cwd,
+    convId: state.convId,
+    dialog: $("bot-dialog"),
+    onBack: () => {
+      leaveResearch();
+      render({ focus: true });
+    },
+    onOpen: (a) => (a.item_id ? jumpToItem({ id: a.item_id, conv_id: a.conv_id, bot_id: a.bot_id, group_id: a.group_id }) : a.group_id ? selectGroup(a.group_id, a.conv_id) : selectBot(a.bot_id, a.conv_id)),
+  });
+  renderSidebar();
+}
+
 // What was typed survives going to a result and coming back.
 const searchState = { q: "", kind: "", cwd: "", bot: "", time: "", status: "", results: null, more: false, error: null };
 
@@ -1003,6 +1084,12 @@ function renderComposer(entity) {
       updateMention(e.target);
       saveDraftSoon();
     },
+    onpaste: (e) => {
+      if (e.clipboardData?.files?.length) {
+        e.preventDefault();
+        void addFiles([...e.clipboardData.files]);
+      }
+    },
     onblur: () => {
       mention.open = false;
       const popup = $("mention-popup");
@@ -1045,11 +1132,26 @@ function renderComposer(entity) {
     { class: "composer-wrap" },
     h("p", { id: "send-error", class: "send-error", role: "alert", hidden: true }),
     h("div", { id: "activity-bar", class: "activity-bar", role: "status", hidden: true }),
+    h("div", { id: "file-strip", class: "file-strip", hidden: true }),
     h("div", { id: "queue-strip", class: "queue-strip", hidden: true }),
     h("div", { id: "mention-popup", class: "mention-popup", role: "listbox", hidden: true }),
     h(
       "div",
-      { class: "composer" },
+      {
+        class: "composer",
+        ondragover: (e) => {
+          e.preventDefault();
+          e.currentTarget.classList.add("dropping");
+        },
+        ondragleave: (e) => e.currentTarget.classList.remove("dropping"),
+        ondrop: (e) => {
+          e.preventDefault();
+          e.currentTarget.classList.remove("dropping");
+          if (e.dataTransfer?.files?.length) void addFiles([...e.dataTransfer.files]);
+        },
+      },
+      h("input", { id: "file-input", type: "file", multiple: true, hidden: true, onchange: (e) => { void addFiles([...e.target.files]); e.target.value = ""; } }),
+      h("button", { class: "icon-btn attach-btn", type: "button", title: "添加文件，也可以直接拖进来或粘贴", "aria-label": "添加文件", onclick: () => $("file-input").click() }, icon("attach", 17)),
       box,
       h("button", { id: "steer-btn", class: "steer-btn", type: "button", hidden: true, title: "把这条消息补充进正在进行的这一轮", onclick: () => followUp("steer") }, "立即补充"),
       h("button", { id: "stop-btn", class: "send-btn stop", type: "button", hidden: true, title: "停止回复", "aria-label": "停止回复", onclick: stopTurn }, icon("stop", 17)),
@@ -1090,6 +1192,7 @@ function renderComposerState() {
   if (hint) hint.textContent = !running ? "Enter 发送，Shift + Enter 换行" : canSteer() ? "Enter 排队，这一轮结束后发出；⌘/Ctrl + Enter 立即补充" : "Enter 排队，这一轮结束后发出。这个 agent 或群聊不能中途补充";
   renderQueue();
   renderActivity();
+  renderFiles();
   const box = $("composer-input");
   if (box) box.disabled = Boolean(blocked);
   const err = $("send-error");
@@ -1173,6 +1276,7 @@ function resultNode(item, attrs) {
       "div",
       { class: "approval-actions" },
       d.repo ? h("button", { type: "button", onclick: () => openResultDiff(item) }, "查看改动") : null,
+      h("button", { type: "button", onclick: openArtifacts }, "全部产物"),
       h("button", { type: "button", onclick: () => fillComposer("请继续修改：") }, "继续修改"),
       d.accepted || d.review === "dismissed" ? null : h("button", { type: "button", class: "primary", title: "只记下你看过并接受了，不会合并或提交任何东西", onclick: () => acceptResult(item) }, "接受结果"),
       d.accepted || d.review ? null : h("button", { type: "button", title: "先放一边，不计入待办数量", onclick: () => reviewResult(item, "later") }, "稍后处理"),
@@ -1297,7 +1401,20 @@ function itemNode(item) {
   const attrs = { "data-item": item.id };
   switch (item.type) {
     case "user":
-      return h("div", { ...attrs, class: "msg user" }, d.steered ? h("span", { class: "chip" }, "运行中补充") : null, h("div", { class: "bubble" }, d.text));
+      return h(
+        "div",
+        { ...attrs, class: "msg user" },
+        d.steered ? h("span", { class: "chip" }, "运行中补充") : null,
+        h(
+          "div",
+          { class: "bubble" },
+          // The paths are for the agent. A person sees the files themselves.
+          d.attachments ? String(d.text).split(ATTACH_MARK)[0].trim() : d.text,
+          d.attachments
+            ? h("div", { class: "msg-files" }, d.attachments.map((a) => h("button", { type: "button", class: "file-chip", title: "预览", onclick: () => previewArtifact({ api, h, dialog: $("bot-dialog") }, a) }, a.preview === "image" ? h("img", { src: `/api/artifacts/${a.id}/file`, alt: "" }) : null, a.name)))
+            : null,
+        ),
+      );
     case "result":
       return resultNode(item, attrs);
     case "assistant": {
@@ -1537,6 +1654,8 @@ function budgetSection(entity) {
   }
   const row = (k, u) => h("div", { class: "kv" }, h("dt", {}, k), h("dd", { class: u.limit && u.spent >= u.limit ? "result-failed" : "" }, useText(u)));
   return [
+    h("h2", { class: "section" }, "产物和附件"),
+    h("button", { type: "button", onclick: openArtifacts }, "查看"),
     h("h2", { class: "section" }, "项目预算"),
     h("dl", {}, row("今天", b.today), row("累计", b.total)),
     h("button", { type: "button", onclick: () => openBudgetDialog(entity) }, "设置与明细"),

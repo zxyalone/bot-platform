@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { summarize } from "./research.ts";
 import { search } from "./search.ts";
+import { MAX_UPLOAD } from "./artifacts.ts";
 import { readQuotas, type QuotaReport } from "./quota.ts";
 import { refineRole, type RefineInput } from "./refine.ts";
 import { CHIEF_ROLE, SETTING_DEFAULTS, type AppSettings } from "./store.ts";
@@ -27,6 +28,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/inbox.js": { file: "inbox.js", type: "text/javascript; charset=utf-8" },
   "/drafts.js": { file: "drafts.js", type: "text/javascript; charset=utf-8" },
   "/search.js": { file: "search.js", type: "text/javascript; charset=utf-8" },
+  "/artifacts.js": { file: "artifacts.js", type: "text/javascript; charset=utf-8" },
   "/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" },
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -142,14 +144,14 @@ async function validateBot(input: any, existing?: Bot, defaults: AppSettings = S
   return out;
 }
 
-export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: number; webDir: string; port: () => number; status?: () => Promise<unknown>; pollMs?: number; sshPollMs?: number; quota?: () => Promise<QuotaReport>; refine?: (i: RefineInput) => Promise<string> }) {
+export function createApp(o: { reveal?: (path: string) => Promise<void>; store: Store; factory: RuntimeFactory; idleMs?: number; webDir: string; port: () => number; status?: () => Promise<unknown>; pollMs?: number; sshPollMs?: number; quota?: () => Promise<QuotaReport>; refine?: (i: RefineInput) => Promise<string> }) {
   const checkBot = (input: any, existing?: Bot) => validateBot(input, existing, o.store.settings());
   const clients = new Set<ServerResponse>();
   const broadcast = (ev: { type: string; [k: string]: unknown }) => {
     const data = `data: ${JSON.stringify(ev)}\n\n`;
     for (const c of clients) c.write(data);
   };
-  const engine = new Engine({ store: o.store, factory: o.factory, broadcast, idleMs: o.idleMs, busUrl: () => `http://127.0.0.1:${o.port()}/internal/bus`, validateBot: checkBot, pollMs: o.pollMs, sshPollMs: o.sshPollMs });
+  const engine = new Engine({ reveal: o.reveal,  store: o.store, factory: o.factory, broadcast, idleMs: o.idleMs, busUrl: () => `http://127.0.0.1:${o.port()}/internal/bus`, validateBot: checkBot, pollMs: o.pollMs, sshPollMs: o.sshPollMs });
   const fetchStatus = o.status ?? agentStatus;
   let statusCache: { at: number; value: Promise<unknown> } | null = null;
   const status = () => {
@@ -170,6 +172,29 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       if (site && site !== "same-origin" && site !== "none") return false;
     }
     return true;
+  };
+
+  const readBytes = (req: IncomingMessage) =>
+    new Promise<Buffer>((res, rej) => {
+      let size = 0;
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => {
+        size += c.length;
+        if (size > MAX_UPLOAD) {
+          rej(new HttpError(413, `文件不能超过 ${MAX_UPLOAD / 1048576} MB`));
+          req.destroy();
+        } else chunks.push(c);
+      });
+      req.on("end", () => res(Buffer.concat(chunks)));
+      req.on("error", rej);
+    });
+
+  const attachmentIds = (body: any): string[] => (Array.isArray(body.attachments) ? body.attachments.filter((a: unknown) => typeof a === "string") : []);
+  const messageText = (body: any): string => {
+    const text = typeof body.text === "string" && body.text.trim() ? body.text : attachmentIds(body).length ? "请看附件。" : "";
+    if (!text) throw new HttpError(400, "消息不能为空");
+    if (text.length > MAX_MESSAGE) throw new HttpError(413, "消息太长");
+    return text;
   };
 
   const readJson = (req: IncomingMessage) =>
@@ -289,9 +314,8 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       if (!cur) throw new HttpError(404, "群聊不存在");
       if (m === "POST" && parts[3] === "messages") {
         const body = await readJson(req);
-        if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "消息不能为空");
-        if (body.text.length > MAX_MESSAGE) throw new HttpError(413, "消息太长");
-        return json(res, 202, await engine.sendGroupMessage(cur.id, typeof body.conversationId === "string" ? body.conversationId : null, body.text));
+        const text = messageText(body);
+        return json(res, 202, await engine.sendGroupMessage(cur.id, typeof body.conversationId === "string" ? body.conversationId : null, text, undefined, attachmentIds(body)));
       }
       if (m === "PATCH" && !parts[3]) {
         const g = o.store.updateGroup(cur.id, await validateGroup(await readJson(req), cur))!;
@@ -325,15 +349,37 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
     }
     if (m === "POST" && parts[1] === "bots" && parts[3] === "messages") {
       const body = await readJson(req);
-      const text = body.text;
-      if (typeof text !== "string" || !text.trim()) throw new HttpError(400, "消息不能为空");
-      if (text.length > MAX_MESSAGE) throw new HttpError(413, "消息太长");
-      const conv = await engine.sendMessage(parts[2], typeof body.conversationId === "string" ? body.conversationId : null, text);
+      const text = messageText(body);
+      const conv = await engine.sendMessage(parts[2], typeof body.conversationId === "string" ? body.conversationId : null, text, attachmentIds(body));
       return json(res, 202, conv);
     }
     if (m === "GET" && pathname === "/api/tasks") {
       const conv = new URL(req.url ?? "/", "http://localhost").searchParams.get("conv");
       return json(res, 200, { tasks: engine.listTasks(conv || null) });
+    }
+    if (m === "POST" && pathname === "/api/uploads") {
+      if (!/^application\/octet-stream\b/i.test(req.headers["content-type"] ?? "")) throw new HttpError(415, "需要 application/octet-stream");
+      const name = new URL(req.url ?? "/", "http://localhost").searchParams.get("name") ?? "";
+      return json(res, 201, engine.artifacts.upload(name, await readBytes(req)));
+    }
+    if (m === "GET" && pathname === "/api/artifacts") {
+      const p = new URL(req.url ?? "/", "http://localhost").searchParams;
+      const cwd = p.get("cwd");
+      if (!cwd) throw new HttpError(400, "需要 cwd");
+      return json(res, 200, { artifacts: engine.artifacts.list({ cwd, convId: p.get("conv") || undefined, kind: p.get("kind") || undefined }), can_reveal: engine.artifacts.canReveal });
+    }
+    if (parts[1] === "artifacts" && parts[2]) {
+      if (m === "GET" && parts[3] === "file") {
+        const f = engine.artifacts.file(parts[2], new URL(req.url ?? "/", "http://localhost").searchParams.has("download"));
+        res.writeHead(200, { "content-type": f.type, "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "cache-control": "no-store", "content-disposition": `${f.inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(f.name)}` });
+        return void res.end(await readFile(f.path));
+      }
+      if (m === "GET" && parts[3] === "text") return json(res, 200, engine.artifacts.text(parts[2]));
+      if (m === "POST" && parts[3] === "reveal") {
+        await readJson(req);
+        await engine.artifacts.reveal(parts[2]);
+        return json(res, 200, { ok: true });
+      }
     }
     if (m === "GET" && pathname === "/api/search") {
       const p = new URL(req.url ?? "/", "http://localhost").searchParams;
@@ -364,9 +410,8 @@ export function createApp(o: { store: Store; factory: RuntimeFactory; idleMs?: n
       if (m === "GET" && parts[3] === "trace") return json(res, 200, engine.trace(parts[2]));
       if (m === "POST" && parts[3] === "followup") {
         const body = await readJson(req);
-        if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "消息不能为空");
-        if (body.text.length > MAX_MESSAGE) throw new HttpError(413, "消息太长");
-        return json(res, 202, await engine.followUp(parts[2], body.text, body.mode === "steer" ? "steer" : "queue"));
+        const text = messageText(body);
+        return json(res, 202, await engine.followUp(parts[2], text, body.mode === "steer" ? "steer" : "queue", attachmentIds(body)));
       }
       if (m === "POST" && parts[3] === "interrupt") {
         await readJson(req);

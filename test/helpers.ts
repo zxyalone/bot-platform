@@ -11,11 +11,11 @@ const webDir = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "web")
 
 export const tempHome = () => mkdtempSync(join(tmpdir(), "bot-platform-test-"));
 
-export async function boot(factory: RuntimeFactory, opts: { home?: string; idleMs?: number; quota?: () => Promise<any>; refine?: (i: any) => Promise<string> } = {}) {
+export async function boot(factory: RuntimeFactory, opts: { home?: string; idleMs?: number; quota?: () => Promise<any>; refine?: (i: any) => Promise<string>; reveal?: (path: string) => Promise<void> } = {}) {
   const home = opts.home ?? tempHome();
   const store = new Store(home);
   let port = 0;
-  const app = createApp({ store, factory, webDir, port: () => port, idleMs: opts.idleMs, pollMs: 30, sshPollMs: 30, quota: opts.quota, refine: opts.refine, status: async () => ({ claude: { installed: true, loggedIn: true, models: [] }, codex: { installed: true, loggedIn: true, models: [] } }) });
+  const app = createApp({ store, factory, webDir, port: () => port, idleMs: opts.idleMs, pollMs: 30, sshPollMs: 30, quota: opts.quota, refine: opts.refine, reveal: opts.reveal, status: async () => ({ claude: { installed: true, loggedIn: true, models: [] }, codex: { installed: true, loggedIn: true, models: [] } }) });
   await new Promise<void>((r) => app.server.listen(0, "127.0.0.1", r));
   port = (app.server.address() as { port: number }).port;
   const base = `http://127.0.0.1:${port}`;

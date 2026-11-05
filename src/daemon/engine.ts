@@ -1,10 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join, extname } from "node:path";
+import { dirname, join, extname, resolve } from "node:path";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { BUS_TOOLS, CHIEF_TOOLS, MODELS, RESEARCH_TOOLS, type AgentEvent, type AgentKind, type AgentRuntime, type ApprovalDecision, type Bot, type Conversation, type Group, type Item, type RuntimeFactory, type TurnStatus } from "./types.ts";
 import { HttpError } from "./errors.ts";
-import { Memory, Worktrees, type MemoryScope, type Worktree, changedSince, git, workState, type WorkState, diffWithNewFiles } from "./git.ts";
+import { Memory, Worktrees, type MemoryScope, type Worktree, changedSince, git, workState, type WorkState, diffWithNewFiles, type ChangedFile } from "./git.ts";
+import { Artifacts } from "./artifacts.ts";
 import { Research } from "./research.ts";
 import type { Store } from "./store.ts";
 
@@ -55,6 +56,7 @@ interface RootTurn {
   baseline: Promise<WorkState | null>;
   cwd: string;
   projectOver: boolean;
+  fileOwners: Map<string, { bot: string; callId: string | null }>;
   startedAt: number;
   lastActivity: number;
   activityTimer: NodeJS.Timeout | null;
@@ -193,12 +195,14 @@ export class Engine {
   private readonly roots = new Map<string, RootTurn>();
   // Sessions promised to a call. Taken before anything awaits, because an agent still starting has no turn to look at yet.
   private readonly sessionsInUse = new Set<string>();
+  readonly artifacts: Artifacts;
   // Conversations with something to send, held back only because no slot is free.
   private readonly slotWaiters = new Set<string>();
   private readonly budgetWarned = new Set<string>();
   private readonly reaper: NodeJS.Timeout;
 
-  constructor(o: { store: Store; factory: RuntimeFactory; broadcast: Broadcast; idleMs?: number; busUrl: () => string; validateBot: (input: any, existing?: Bot) => Promise<any>; pollMs?: number; sshPollMs?: number }) {
+  constructor(o: { store: Store; factory: RuntimeFactory; broadcast: Broadcast; idleMs?: number; busUrl: () => string; validateBot: (input: any, existing?: Bot) => Promise<any>; pollMs?: number; sshPollMs?: number; reveal?: (path: string) => Promise<void> }) {
+    this.artifacts = new Artifacts(o.store, o.reveal);
     this.store = o.store;
     this.factory = o.factory;
     this.publish = o.broadcast;
@@ -266,7 +270,7 @@ export class Engine {
   private openRoot(convId: string, limit: number): RootTurn {
     const now = Date.now();
     const cwd = this.store.getConversation(convId)!.cwd;
-    const root: RootTurn = { id: randomUUID(), convId, limit, spent: 0, callCount: 0, activeCalls: 0, active: new Set(), stopping: false, overBudget: false, stopNote: null, tasks: new Map(), baseline: workState(cwd), cwd, projectOver: false, startedAt: now, lastActivity: now, activityTimer: null, files: new Set(), checks: [], lastText: "" };
+    const root: RootTurn = { id: randomUUID(), convId, limit, spent: 0, callCount: 0, activeCalls: 0, active: new Set(), stopping: false, overBudget: false, stopNote: null, tasks: new Map(), baseline: workState(cwd), cwd, projectOver: false, fileOwners: new Map(), startedAt: now, lastActivity: now, activityTimer: null, files: new Set(), checks: [], lastText: "" };
     this.roots.set(convId, root);
     this.store.createRootTurn(root.id, convId, limit);
     this.broadcastBudget(root, true);
@@ -458,7 +462,48 @@ export class Engine {
       mkdirSync(this.resultsDir, { recursive: true });
       writeFileSync(join(this.resultsDir, `${item.id}.json`), JSON.stringify(snapshot));
     }
+    await this.recordArtifacts(root, before, gitFiles, made, item.id);
     return item.id;
+  }
+
+  // Who made a file is only known when a tool said so. Git shows that it changed, not by whom.
+  private async recordArtifacts(root: RootTurn, before: WorkState | null, gitFiles: ChangedFile[], made: Worktree[], itemId: string) {
+    const real = (p: string) => {
+      try {
+        return realpathSync(p);
+      } catch {
+        return resolve(p);
+      }
+    };
+    const owners = new Map([...root.fileOwners].map(([p, o]) => [real(p), o]));
+    const originOf = (path: string, fallback: string) => {
+      const o = owners.get(real(path));
+      if (!o) return fallback;
+      const q = o.callId ? this.store.getCall(o.callId) : undefined;
+      return q ? `${o.bot} 的${q.mode === "task" ? "任务" : "调用"}：${firstLine(q.question)}` : `${o.bot} 改的`;
+    };
+    const testDir = this.research.settings(Memory.projectId(root.cwd)).test_dir;
+    const hidden = testDir ? real(testDir) : "";
+    const allowed = (p: string) => !hidden || (real(p) !== hidden && !real(p).startsWith(`${hidden}/`));
+    const rows: Parameters<Artifacts["record"]>[0] = [];
+    const add = (path: string, base: string, change: string, origin: string) => {
+      if (allowed(path)) rows.push({ path, root: base, change, origin: originOf(path, origin), convId: root.convId, itemId, cwd: root.cwd });
+    };
+    if (before) for (const f of gitFiles) if (f.change === "新增" || f.change === "修改") add(join(before.top, f.path), before.top, f.change, "这一轮改的（没有工具上报是谁）");
+    // Outside Git, or missed by it: only a tool's word, and only within this project's directory.
+    if (!gitFiles.length) {
+      const base = real(root.cwd);
+      for (const f of root.files) {
+        const path = resolve(root.cwd, f);
+        if (real(path).startsWith(`${base}/`)) add(path, base, "修改", "工具上报");
+      }
+    }
+    for (const w of made) {
+      const state = await workState(w.path);
+      if (!state) continue;
+      for (const [path, stamp] of state.files) if (!stamp.endsWith("gone")) add(join(state.top, path), state.top, stamp.slice(0, 2).includes("?") ? "新增" : "修改", `${w.bot_name} 的工作树 ${w.branch}`);
+    }
+    this.artifacts.record(rows.slice(0, MAX_RESULT_FILES * 2));
   }
 
   private get resultsDir() {
@@ -622,11 +667,11 @@ export class Engine {
   }
 
   // ---------- messages sent while a round is running ----------
-  async followUp(convId: string, text: string, mode: string) {
+  async followUp(convId: string, text: string, mode: string, attachments: string[] = []) {
     const conv = this.store.getConversation(convId);
     if (!conv || (conv.kind !== "direct" && conv.kind !== "group") || conv.archived) throw new HttpError(404, "对话不存在");
     if (conv.status !== "running") {
-      await this.dispatch(conv, text);
+      await this.dispatch(conv, text, undefined, attachments);
       return { delivered: "sent" };
     }
     if (this.roots.get(convId)?.stopping) throw new HttpError(409, "这一轮正在停止，停下来之后再发");
@@ -637,22 +682,23 @@ export class Engine {
     const l = this.live.get(convId);
     if (mode === "steer" && conv.kind === "direct" && l?.turnId && l.runtime.steer) {
       const turnId = l.turnId;
-      const steered = await l.runtime.steer(text).then(() => true, () => false);
+      const files = this.artifacts.attach(conv.cwd, convId, attachments);
+      const steered = await l.runtime.steer(text + files.footer).then(() => true, () => false);
       if (steered) {
         l.lateConv = convId;
-        this.addItem(convId, turnId, "user", "done", { text, steered: true });
+        this.addItem(convId, turnId, "user", "done", { text: text + files.footer, steered: true, ...(files.list.length ? { attachments: files.list } : {}) });
         return { delivered: "steered" };
       }
     }
     if (this.store.listItems(convId).filter((i) => i.type === "queued" && i.status === "queued").length >= MAX_QUEUED) throw new HttpError(409, `最多排队 ${MAX_QUEUED} 条，请等前面的发出`);
-    const item = this.addItem(convId, null, "queued", "queued", { text });
+    const item = this.addItem(convId, null, "queued", "queued", { text, attachment_ids: attachments });
     // The turn may have ended while the steer was being refused.
     if (this.store.getConversation(convId)?.status !== "running" && !this.roots.has(convId)) this.pumpQueue(convId);
     return { delivered: "queued", itemId: item.id };
   }
 
-  private async dispatch(conv: Conversation, text: string, only?: Bot[]) {
-    return conv.kind === "group" ? this.sendGroupMessage(conv.group_id!, conv.id, text, only) : this.sendMessage(conv.bot_id!, conv.id, text);
+  private async dispatch(conv: Conversation, text: string, only?: Bot[], attachments: string[] = []) {
+    return conv.kind === "group" ? this.sendGroupMessage(conv.group_id!, conv.id, text, only, attachments) : this.sendMessage(conv.bot_id!, conv.id, text, attachments);
   }
 
   // Each queued message is an ordinary message, with its own round and budget. True if one was sent.
@@ -667,7 +713,7 @@ export class Engine {
       return true;
     }
     this.updateItem(next.id, { status: "sent" });
-    void this.dispatch(conv, String(next.data.text)).catch((e) => {
+    void this.dispatch(conv, String(next.data.text), undefined, (next.data.attachment_ids as string[]) ?? []).catch((e) => {
       this.updateItem(next.id, { status: "unsent", data: { ...next.data, reason: (e as Error).message } });
       this.pumpQueue(convId);
     });
@@ -683,7 +729,7 @@ export class Engine {
     if (!item || item.type !== "queued") throw new HttpError(404, "没有这条排队的消息");
     if (item.status !== "queued" && item.status !== "unsent") throw new HttpError(409, "这条消息已经发出了");
     this.updateItem(itemId, { status: "withdrawn" });
-    return { text: item.data.text };
+    return { text: item.data.text, attachment_ids: item.data.attachment_ids ?? [] };
   }
 
   private broadcastBudget(root: RootTurn, active: boolean) {
@@ -722,7 +768,8 @@ export class Engine {
   }
 
   // ---------- user messages ----------
-  async sendMessage(botId: string, conversationId: string | null, text: string): Promise<Conversation> {
+  async sendMessage(botId: string, conversationId: string | null, typed: string, attachments: string[] = []): Promise<Conversation> {
+    let text = typed;
     const bot = this.store.getBot(botId);
     if (!bot) throw new HttpError(404, "Bot 不存在");
     this.checkCanStart((conversationId && this.store.getConversation(conversationId)?.cwd) || bot.cwd);
@@ -733,8 +780,10 @@ export class Engine {
     if (conv.agent !== bot.agent) throw new HttpError(409, "这个 Bot 已换了底层 agent，旧对话无法继续，请新建对话");
     if (!conversationId) this.broadcast({ type: "conversation", conversation: conv });
 
+    const files = this.artifacts.attach(conv.cwd, conv.id, attachments);
+    text += files.footer;
     const prompt = this.withNotices(conv.id, text);
-    const request = this.addItem(conv.id, null, "user", "done", { text });
+    const request = this.addItem(conv.id, null, "user", "done", { text, ...(files.list.length ? { attachments: files.list } : {}) });
     this.setConversation(conv.id, { status: "running" });
     const root = this.openRoot(conv.id, bot.budget_tokens);
     root.requestItem = request.id;
@@ -743,7 +792,8 @@ export class Engine {
   }
 
   // `only` is for a retry: the failed members run again, whatever names the quoted request mentions.
-  async sendGroupMessage(groupId: string, conversationId: string | null, text: string, only?: Bot[]): Promise<Conversation> {
+  async sendGroupMessage(groupId: string, conversationId: string | null, typed: string, only?: Bot[], attachments: string[] = []): Promise<Conversation> {
+    let text = typed;
     const group = this.store.getGroup(groupId);
     if (!group) throw new HttpError(404, "群聊不存在");
     const members = this.store.groupMembers(groupId);
@@ -758,7 +808,9 @@ export class Engine {
     if (conv.status === "running") throw new HttpError(409, "这个对话还在回复中");
     if (!conversationId) this.broadcast({ type: "conversation", conversation: conv });
 
-    const request = this.addItem(conv.id, null, "user", "done", { text });
+    const files = this.artifacts.attach(conv.cwd, conv.id, attachments);
+    text += files.footer;
+    const request = this.addItem(conv.id, null, "user", "done", { text, ...(files.list.length ? { attachments: files.list } : {}) });
     this.setConversation(conv.id, { status: "running" });
     const root = this.openRoot(conv.id, group.budget_tokens);
     root.requestItem = request.id;
@@ -967,6 +1019,7 @@ export class Engine {
         for (const f of ev.files ?? []) {
           l.files.add(f);
           ctx.root.files.add(f);
+          ctx.root.fileOwners.set(resolve(this.store.getConversation(l.convId)!.cwd, f), { bot: l.bot.name, callId: ctx.callId });
         }
         if (id) {
           const cur = this.store.getItem(id)!;
