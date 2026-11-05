@@ -6,6 +6,7 @@ import { mountSettings } from "./settings.js";
 import { mountTasks, TASK_STATUS } from "./tasks.js";
 import { mountInbox } from "./inbox.js";
 import { mountSearch } from "./search.js";
+import { mountProject } from "./project.js";
 import { mountArtifacts, previewArtifact } from "./artifacts.js";
 import { draftKey as keyFor, loadDrafts, saveDrafts } from "./drafts.js";
 
@@ -256,6 +257,7 @@ const pendingDeltas = new Set();
 let deltaFrame = 0;
 
 function handleEvent(ev) {
+  if (state.view === "project" && ["item", "budget", "trace", "conversation"].includes(ev.type)) refreshProjectPage();
   switch (ev.type) {
     case "delta": {
       const item = state.items.find((i) => i.id === ev.itemId);
@@ -702,7 +704,7 @@ function renderSidebar() {
     h("div", { class: "bot-list" }, groupRows.length ? groupRows : h("p", { class: "empty-hint" }, "把几个 Bot 拉进群聊，需要谁就 @ 谁。")),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "Bots"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建 Bot", title: "新建 Bot", onclick: () => openBotDialog() }, icon("plus", 16))),
     h("div", { class: "bot-list" }, rows.length ? rows : h("p", { class: "empty-hint" }, "还没有 Bot，先建一个。")),
-    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "search" ? " on" : ""}`, type: "button", title: "⌘K 或 Ctrl+K", onclick: openSearch }, icon("search", 16), "搜索"), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", waitingCount() ? h("span", { class: "inbox-count", "aria-label": `${waitingCount()} 项待处理` }, String(waitingCount())) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
+    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "project" ? " on" : ""}`, type: "button", onclick: openProject }, icon("folder", 16), "项目"), h("button", { class: `side-settings${state.view === "search" ? " on" : ""}`, type: "button", title: "⌘K 或 Ctrl+K", onclick: openSearch }, icon("search", 16), "搜索"), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", waitingCount() ? h("span", { class: "inbox-count", "aria-label": `${waitingCount()} 项待处理` }, String(waitingCount())) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
   );
 }
 
@@ -857,7 +859,55 @@ async function jumpToItem(entry) {
   setTimeout(() => node.classList.remove("item-flash"), 2000);
 }
 
-function openArtifacts() {
+async function openProject() {
+  saveDraft();
+  const entity = currentEntity();
+  const { projects } = await api("/api/projects");
+  if (!projects.length) return;
+  state.view = "project";
+  state.sidebarOpen = false;
+  $("app").classList.remove("sidebar-open");
+  $("app").classList.add("full-page");
+  // Anyone working in the project can stand in for it, which is how the other pages are reached.
+  const ownerOf = (id) => [...state.groups, ...state.bots].find((e) => e.project_memory === id);
+  const go = async (owner) => (state.groups.includes(owner) ? selectGroup(owner.id) : selectBot(owner.id));
+  state.page = mountProject($("main"), {
+    api,
+    h,
+    projects,
+    cwd: entity && projects.some((p) => p.cwd === entity.cwd) ? entity.cwd : projects[0].cwd,
+    onBack: () => {
+      leaveResearch();
+      render({ focus: true });
+    },
+    onOpen: (a) => (a.group_id ? selectGroup(a.group_id, a.conv_id) : selectBot(a.bot_id, a.conv_id)),
+    onJump: jumpToItem,
+    onTasks: openTasks,
+    onArtifacts: async (d) => {
+      await go(ownerOf(d.project_id));
+      openArtifacts(true);
+    },
+    onResearch: async (d) => {
+      await go(ownerOf(d.project_id));
+      openResearch();
+    },
+    onBudget: async (d, done) => {
+      const owner = ownerOf(d.project_id);
+      state.budget = await api(`/api/projects/${d.project_id}/budget?cwd=${encodeURIComponent(d.cwd)}`);
+      openBudgetDialog(owner);
+      $("bot-dialog").addEventListener("close", done, { once: true });
+    },
+  });
+  renderSidebar();
+}
+
+let projectTimer = 0;
+function refreshProjectPage() {
+  clearTimeout(projectTimer);
+  projectTimer = setTimeout(() => state.view === "project" && state.page?.refresh(), 500);
+}
+
+function openArtifacts(wholeProject) {
   saveDraft();
   const entity = currentEntity();
   if (!entity) return;
@@ -869,7 +919,7 @@ function openArtifacts() {
     api,
     h,
     cwd: entity.cwd,
-    convId: state.convId,
+    convId: wholeProject === true ? null : state.convId,
     dialog: $("bot-dialog"),
     onBack: () => {
       leaveResearch();
@@ -1768,8 +1818,8 @@ function budgetSection(entity) {
   }
   const row = (k, u) => h("div", { class: "kv" }, h("dt", {}, k), h("dd", { class: u.limit && u.spent >= u.limit ? "result-failed" : "" }, useText(u)));
   return [
-    h("h2", { class: "section" }, "产物和附件"),
-    h("button", { type: "button", onclick: openArtifacts }, "查看"),
+    h("h2", { class: "section" }, "项目"),
+    h("div", { class: "project-links" }, h("button", { type: "button", onclick: openProject }, "项目工作台"), h("button", { type: "button", onclick: openArtifacts }, "产物和附件")),
     h("h2", { class: "section" }, "项目预算"),
     h("dl", {}, row("今天", b.today), row("累计", b.total)),
     h("button", { type: "button", onclick: () => openBudgetDialog(entity) }, "设置与明细"),

@@ -155,7 +155,7 @@ export class Store {
       for (const cwd of cwds) {
         const from = projectId(cwd);
         const to = projectId(moved(cwd));
-        for (const t of ["ideas", "experiments", "project_settings"]) if (hasTable(t)) this.db.prepare(`UPDATE OR IGNORE ${t} SET project_id=? WHERE project_id=?`).run(to, from);
+        for (const t of ["ideas", "experiments", "project_settings", "project_info"]) if (hasTable(t)) this.db.prepare(`UPDATE OR IGNORE ${t} SET project_id=? WHERE project_id=?`).run(to, from);
         const dir = join(this.home, "memory", "projects");
         if (existsSync(join(dir, from)) && !existsSync(join(dir, to))) renameSync(join(dir, from), join(dir, to));
       }

@@ -6,6 +6,7 @@ import { BUS_TOOLS, CHIEF_TOOLS, MODELS, RESEARCH_TOOLS, type AgentEvent, type A
 import { HttpError } from "./errors.ts";
 import { Memory, Worktrees, type MemoryScope, type Worktree, changedSince, git, workState, type WorkState, diffWithNewFiles, type ChangedFile } from "./git.ts";
 import { Artifacts } from "./artifacts.ts";
+import { Projects } from "./projects.ts";
 import { Research } from "./research.ts";
 import type { Store } from "./store.ts";
 
@@ -222,6 +223,7 @@ export class Engine {
   // Sessions promised to a call. Taken before anything awaits, because an agent still starting has no turn to look at yet.
   private readonly sessionsInUse = new Set<string>();
   readonly artifacts: Artifacts;
+  readonly projects: Projects;
   // Conversations with something to send, held back only because no slot is free.
   private readonly slotWaiters = new Set<string>();
   private readonly budgetWarned = new Set<string>();
@@ -229,6 +231,7 @@ export class Engine {
 
   constructor(o: { store: Store; factory: RuntimeFactory; broadcast: Broadcast; idleMs?: number; busUrl: () => string; validateBot: (input: any, existing?: Bot) => Promise<any>; pollMs?: number; sshPollMs?: number; reveal?: (path: string) => Promise<void> }) {
     this.artifacts = new Artifacts(o.store, o.reveal);
+    this.projects = new Projects(o.store);
     this.store = o.store;
     this.factory = o.factory;
     this.publish = o.broadcast;
@@ -313,6 +316,37 @@ export class Engine {
       muted: Boolean(s.muted),
       total: { spent: this.store.projectSpent(cwd, 0), limit: s.budget_total as number },
       today: { spent: this.store.projectSpent(cwd, midnight), limit: s.budget_daily as number },
+    };
+  }
+
+  projectOverview(cwd: string, since: number | null) {
+    const id = Memory.projectId(cwd);
+    const brief = this.projects.brief(id);
+    const at = since ?? brief.last_seen;
+    const { conversations, results, worktrees } = this.projects.recent(cwd);
+    const inProject = (convId: unknown) => this.store.getConversation(convId as string)?.cwd === cwd;
+    const tasks = this.listTasks(null).filter((t) => inProject(t.conv_id));
+    const research = this.research.settings(id);
+    return {
+      project_id: id,
+      cwd,
+      name: brief.name || cwd.split("/").filter(Boolean).slice(-1)[0] || cwd,
+      brief,
+      since: at ? this.projects.since(cwd, at) : null,
+      active: conversations.filter((c) => c.status === "running").map((c) => ({ conv_id: c.id, title: c.title, bot_id: c.bot_id, group_id: c.group_id, activity: this.activity(c.id as string) })),
+      inbox: this.listInbox().filter((i) => inProject(i.conv_id)),
+      tasks: {
+        running: tasks.filter((t) => STILL_GOING.includes(t.status as string)).map((t) => ({ id: t.id, owner: t.owner, title: firstLine(t.question), status: t.status, waiting_reason: t.waiting_reason })),
+        attention: tasks.filter((t) => t.can_retry).map((t) => ({ id: t.id, owner: t.owner, title: firstLine(t.question), status: t.status })),
+      },
+      conversations,
+      results,
+      worktrees,
+      bots: this.store.listBots().filter((b) => b.cwd === cwd).map((b) => ({ id: b.id, name: b.name, agent: b.agent, model: b.model, paused: Boolean(b.paused) })),
+      groups: this.store.listGroups().filter((g) => g.cwd === cwd).map((g) => ({ id: g.id, name: g.name })),
+      budget: this.projectBudget(cwd),
+      artifact_total: this.artifacts.list({ cwd }).length,
+      research: { enabled: Boolean(research.enabled), running: this.research.listExperiments(id).filter((e) => e.status === "running").length, ideas: this.research.listIdeas(id).filter((i) => i.suggested_verdict).length },
     };
   }
 
@@ -999,9 +1033,10 @@ export class Engine {
           if (this.live.get(sessionConvId) !== live) throw new Error("进程启动后立刻退出了");
           // Starting can take a while, and the person may have cancelled this meanwhile. Nothing has been sent yet, so nothing needs undoing.
           if (stopped()) return resolve({ status: "interrupted", text: "", tokens: 0 });
+          const note = this.projects.updateNote(sessionConvId, this.projects.promptSection(ctx.root.cwd), Boolean(this.store.getConversation(sessionConvId)?.session_id));
           Object.assign(live, { turnId, turnStarted: Date.now(), lastUsed: Date.now(), usage: null, ctx, resolve, ticks: 0, turnTokens: 0, texts: [], files: new Set(), lateConv: null });
           ctx.root.active.add(live);
-          await live.runtime.send(prompt);
+          await live.runtime.send(note + prompt);
         } catch (e) {
           const message = `无法启动 ${bot.agent}：${(e as Error).message}`;
           this.dropRuntime(sessionConvId);
@@ -1023,7 +1058,9 @@ export class Engine {
   private async ensureRuntime(bot: Bot, convId: string, extraSystem: string, ctx: TurnCtx): Promise<Live> {
     // Optional module: projects that do not use it pay nothing for its tool definitions.
     const research = this.researchEnabled(ctx.root.convId);
-    const key = this.configKey(bot, extraSystem, research);
+    // The project is the round's, so a Bot working in a worktree still reads what the person wrote.
+    const brief = this.projects.promptSection(ctx.root.cwd);
+    const key = this.configKey(bot, `${extraSystem}${brief}`, research);
     const existing = this.live.get(convId);
     if (existing && existing.configKey === key) return existing;
     if (existing) this.dropRuntime(convId);
@@ -1061,7 +1098,7 @@ export class Engine {
       permission: bot.permission,
       route: conv.route,
       cwd: conv.cwd,
-      systemPrompt: [bot.role, extraSystem, memory].filter(Boolean).join("\n\n"),
+      systemPrompt: [bot.role, extraSystem, brief, memory].filter(Boolean).join("\n\n"),
       sessionId: conv.session_id,
       bus: { command: process.execPath, args: [BUS_SHIM], env: { BUS_URL: this.busUrl(), BUS_TOKEN: busToken, BUS_TOOLS: tools.join(",") } },
       onEvent: (ev) => {

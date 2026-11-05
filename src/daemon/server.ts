@@ -29,6 +29,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/drafts.js": { file: "drafts.js", type: "text/javascript; charset=utf-8" },
   "/search.js": { file: "search.js", type: "text/javascript; charset=utf-8" },
   "/artifacts.js": { file: "artifacts.js", type: "text/javascript; charset=utf-8" },
+  "/project.js": { file: "project.js", type: "text/javascript; charset=utf-8" },
   "/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" },
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -471,6 +472,7 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
         return json(res, 200, { ok: true });
       }
     }
+    if (m === "GET" && pathname === "/api/projects") return json(res, 200, { projects: engine.projects.list() });
     if (parts[1] === "projects" && parts[2]) {
       const pid = parts[2];
       if (!/^[0-9a-f]{16}$/.test(pid)) throw new HttpError(400, "项目 ID 无效");
@@ -478,6 +480,19 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
       if (m === "GET" && parts[3] === "research") {
         const experiments = r.listExperiments(pid);
         return json(res, 200, { settings: r.settings(pid), targets: r.listTargets(), ideas: r.listIdeas(pid), experiments, summary: summarize(experiments), finalEvals: r.finalEvalCount(pid) });
+      }
+      if (m === "GET" && parts[3] === "overview") {
+        const p = new URL(req.url ?? "/", "http://localhost").searchParams;
+        const cwd = p.get("cwd") ?? "";
+        if (Memory.projectId(cwd) !== pid) throw new HttpError(400, "工作目录和项目不一致");
+        const since = Number(p.get("since"));
+        return json(res, 200, engine.projectOverview(cwd, Number.isFinite(since) && since > 0 ? since : null));
+      }
+      if (m === "PUT" && parts[3] === "brief") return json(res, 200, engine.projects.saveBrief(pid, await readJson(req)));
+      if (m === "POST" && parts[3] === "seen") {
+        await readJson(req);
+        engine.projects.markSeen(pid);
+        return json(res, 200, { ok: true });
       }
       if (m === "GET" && parts[3] === "budget") {
         const cwd = new URL(req.url ?? "/", "http://localhost").searchParams.get("cwd") ?? "";
