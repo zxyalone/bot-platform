@@ -6,7 +6,7 @@ import { HttpError } from "./errors.ts";
 import { git, Memory } from "./git.ts";
 import type { Projects } from "./projects.ts";
 import { CHIEF_ROLE, ENGINEER_ROLE, REVIEWER_ROLE, type Store } from "./store.ts";
-import { MODELS, type AgentKind, type Effort, type PermissionPreset } from "./types.ts";
+import { validModel, type AgentKind, type Effort, type PermissionPreset } from "./types.ts";
 
 const SCHOLAR_ROLE = "你是团队的调研员 Scholar，负责查资料和整理已有工作。结论都要有出处，写明链接或文件路径；查不到就直接说查不到，不要编造引用。不改文件。";
 
@@ -17,6 +17,32 @@ export const WORKSPACE_TEMPLATES = [
   { key: "reviewer", name: "Reviewer", role: REVIEWER_ROLE, agent: "claude", model: "claude-sonnet-5-5", effort: "medium", permission: "ask", required: false, on: true, summary: "审查成果、挑错" },
   { key: "scholar", name: "Scholar", role: SCHOLAR_ROLE, agent: "antigravity", model: "gemini-3.8-flash", effort: "medium", permission: "read_only", required: false, on: false, summary: "查资料、整理已有工作" },
 ] as const;
+
+// Who fills each seat when its first choice is not installed here, cheapest sensible model first.
+const PREFER: Record<string, [AgentKind, string][]> = {
+  chief: [["claude", "claude-sonnet-5-5"], ["codex", "gpt-6.1-terra"], ["antigravity", "gemini-4-argon"], ["grok", "grok-4.7"]],
+  engineer: [["codex", "gpt-6.1-terra"], ["claude", "claude-sonnet-5-5"], ["grok", "grok-4.7-build-fast"], ["antigravity", "gemini-4-argon"]],
+  reviewer: [["claude", "claude-sonnet-5-5"], ["codex", "gpt-6-astra"], ["antigravity", "gemini-4-argon"], ["grok", "grok-4.7"]],
+  scholar: [["antigravity", "gemini-3.8-flash"], ["grok", "grok-4.7-build-fast"], ["claude", "claude-haiku-5-5"], ["codex", "gpt-6-luna"]],
+};
+
+export type AgentStatusMap = Record<string, { installed: boolean; loggedIn: boolean; models: string[] } | undefined>;
+
+// Each seat on an agent this person can actually use: logged in first, then merely installed.
+export function templatesFor(status: AgentStatusMap) {
+  const ready = (a: string) => Boolean(status[a]?.installed && status[a]?.loggedIn);
+  const installed = (a: string) => Boolean(status[a]?.installed);
+  const usable = Object.keys(status).filter(ready);
+  return WORKSPACE_TEMPLATES.map(({ role: _role, ...t }) => {
+    const options = PREFER[t.key] ?? [[t.agent, t.model]];
+    const pick = options.find(([a]) => ready(a)) ?? options.find(([a]) => installed(a));
+    const models = pick ? status[pick[0]]?.models ?? [] : [];
+    const model = pick && (models.includes(pick[1]) || !models.length) ? pick[1] : models[0];
+    // A seat only one agent could fill does not need a second Bot on the same agent unless asked.
+    const on = t.on || (t.key === "scholar" && usable.length >= 3);
+    return { ...t, on, agent: pick?.[0] ?? null, model: pick ? model : null, ready: pick ? ready(pick[0]) : false };
+  });
+}
 
 const folderName = (name: string) => name.replace(/[\u0000-\u001f\u007f/\\:*?"<>|]/g, " ").replace(/\s+/g, " ").replace(/^\.+/, "").trim().slice(0, 60) || "workspace";
 const expand = (p: string) => (p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -37,7 +63,7 @@ export async function createWorkspace(store: Store, projects: Projects, input: a
     const w = wanted.find((x) => x?.key === t.key);
     const agent = (w?.agent ?? t.agent) as AgentKind;
     const model = w?.model ?? t.model;
-    if (!MODELS[agent]?.includes(model)) throw new HttpError(400, `${t.name} 的模型 ${model} 不属于 ${agent}`);
+    if (!validModel(agent, model)) throw new HttpError(400, `${t.name} 的模型 ${model} 不属于 ${agent}`);
     return { ...t, agent, model };
   });
 

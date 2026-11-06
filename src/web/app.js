@@ -7,6 +7,7 @@ import { mountTasks, TASK_STATUS } from "./tasks.js";
 import { mountInbox } from "./inbox.js";
 import { mountSearch } from "./search.js";
 import { mountCalls } from "./calls.js";
+import { routineSection } from "./routines.js";
 import { mountProject } from "./project.js";
 import { mountArtifacts, previewArtifact } from "./artifacts.js";
 import { draftKey as keyFor, loadDrafts, saveDrafts } from "./drafts.js";
@@ -29,6 +30,8 @@ function applyAppearance(a) {
   localStorage.setItem("bot-appearance", JSON.stringify({ theme: a.theme, accent: a.accent, font: a.font, density: a.density, width: a.width }));
   if (state.settings !== a) state.settings = a;
   $("app").classList.toggle("no-details", a.details_open === false);
+  // Inside the Mac app the window chrome follows the page's theme.
+  window.webkit?.messageHandlers?.theme?.postMessage({ dark });
 }
 
 // A browser that refuses storage costs the drafts, not the page.
@@ -303,6 +306,14 @@ function handleEvent(ev) {
     }
     case "notify": {
       showNotification(ev);
+      return;
+    }
+    case "routine": {
+      const b = state.bots.find((x) => x.id === ev.botId);
+      if (!b) return;
+      const list = (b.routines ?? []).filter((r) => r.id !== ev.id);
+      b.routines = ev.routine ? [...list, ev.routine].sort((x, y) => x.created_at - y.created_at) : list;
+      if (b.id === state.botId) renderDetails();
       return;
     }
     case "bot_calls": {
@@ -706,19 +717,25 @@ function openWorkspaceDialog() {
   const dlg = $("bot-dialog");
   const status = state.agentStatus ?? {};
   const usable = Object.entries(status).filter(([, a]) => a?.installed).flatMap(([agent, a]) => (a.models ?? []).map((model) => ({ agent, model })));
+  for (const t of state.workspaceTemplates) if (t.agent && t.model && !usable.some((m) => m.agent === t.agent && m.model === t.model)) usable.push({ agent: t.agent, model: t.model });
   const key = (m) => `${m.agent}|${m.model}`;
   const name = h("input", { maxlength: 40, placeholder: "比如：肝脏肿瘤分割", "aria-label": "名称" });
   const folder = h("input", { placeholder: "留空则放在 ~/BotWorkspaces/ 下，也可以填已有目录", "aria-label": "目录" });
   const goal = h("textarea", { rows: 3, maxlength: 4000, placeholder: "这个工作空间要做成什么（可不填，之后能改）", "aria-label": "目标" });
   const picks = state.workspaceTemplates.map((t) => {
-    const check = h("input", { type: "checkbox", checked: t.on ? true : null, disabled: t.required ? true : null, "aria-label": t.name });
-    const model = h("select", { "aria-label": `${t.name} 的模型` }, usable.map((m) => h("option", { value: key(m) }, `${AGENT_LABEL[m.agent]} · ${modelLabel(m.model)}`)));
-    // The suggested model, unless that agent is not installed here.
-    model.value = usable.some((m) => m.agent === t.agent && m.model === t.model) ? `${t.agent}|${t.model}` : (usable[0] ? key(usable[0]) : "");
+    const check = h("input", { type: "checkbox", checked: t.on && t.agent ? true : null, disabled: t.required ? true : null, "aria-label": t.name });
+    const model = h("select", { "aria-label": `${t.name} 的模型` }, usable.map((m) => h("option", { value: key(m) }, `${AGENT_LABEL[m.agent]} · ${modelLabel(m.model)}${status[m.agent]?.loggedIn ? "" : "（未登录）"}`)));
+    // Suggested by the daemon from the agents installed here.
+    model.value = t.agent ? `${t.agent}|${t.model}` : (usable[0] ? key(usable[0]) : "");
     return { t, check, model };
   });
   const error = h("p", { class: "send-error", role: "alert", hidden: true });
   const create = async () => {
+    if (!usable.length) {
+      error.hidden = false;
+      error.textContent = "这台电脑上还没有可用的 agent。先安装并登录至少一个。";
+      return;
+    }
     try {
       const bots = picks.filter((p) => p.t.required || p.check.checked).map((p) => {
         const [agent, model] = p.model.value.split("|");
@@ -761,6 +778,16 @@ function openWorkspaceDialog() {
   name.focus();
 }
 
+// A chat-list row: name and time on top, the latest conversation underneath.
+function rowText(name, tags, latest, fallback, running) {
+  return h(
+    "span",
+    { class: "bot-row-text" },
+    h("span", { class: "bot-row-top" }, h("span", { class: "bot-row-name" }, name, tags), running ? h("span", { class: "status-dot", title: "回复中", role: "img", "aria-label": "回复中" }) : latest ? h("span", { class: "bot-row-time" }, timeLabel(latest.updated_at)) : null),
+    h("span", { class: "bot-row-meta" }, latest?.title ?? fallback),
+  );
+}
+
 function renderSidebar() {
   const root = $("sidebar");
   const convList = (owner) =>
@@ -786,9 +813,8 @@ function renderSidebar() {
       h(
         "button",
         { class: `bot-row${selected ? " selected" : ""}`, type: "button", "aria-current": selected ? "true" : null, onclick: () => selectGroup(g.id) },
-        h("span", { class: "group-avatar" }, groupMembers(g).slice(0, 4).map((m) => avatar(m.id, 17))),
-        h("span", { class: "bot-row-text" }, h("span", { class: "bot-row-name" }, g.name), h("span", { class: "bot-row-meta" }, groupMembers(g).map((m) => m.name).join("、"))),
-        running ? h("span", { class: "status-dot", role: "img", "aria-label": "回复中" }) : null,
+        h("span", { class: "group-avatar" }, groupMembers(g).slice(0, 4).map((m) => avatar(m.id, 19))),
+        rowText(g.name, null, g.conversations[0], groupMembers(g).map((m) => m.name).join("、"), running),
       ),
       selected ? convList(g) : null,
     );
@@ -799,9 +825,8 @@ function renderSidebar() {
     const row = h(
       "button",
       { class: `bot-row${selected ? " selected" : ""}`, type: "button", "aria-current": selected ? "true" : null, onclick: () => selectBot(b.id) },
-      avatar(b.id),
-      h("span", { class: "bot-row-text" }, h("span", { class: "bot-row-name" }, b.name, b.is_chief ? h("span", { class: "tag" }, "主") : null, b.paused ? h("span", { class: "tag muted-tag" }, "已暂停") : null), h("span", { class: "bot-row-meta" }, `${AGENT_LABEL[b.agent]} · ${modelLabel(b.model)}`)),
-      running ? h("span", { class: "status-dot", title: "回复中", role: "img", "aria-label": "回复中" }) : null,
+      avatar(b.id, 40),
+      rowText(b.name, [b.is_chief ? h("span", { class: "tag" }, "主") : null, b.paused ? h("span", { class: "tag muted-tag" }, "已暂停") : null], b.conversations[0], `${AGENT_LABEL[b.agent]} · ${modelLabel(b.model)}`, running),
     );
     const convs = selected ? convList(b) : null;
     const calls = selected && b.call_count ? h("button", { class: "conv-row conv-calls", type: "button", title: "其他 Bot 让它做的事，不在私聊里", onclick: () => openCalls(b) }, icon("inbox", 14), `被调用记录 ${b.call_count}`) : null;
@@ -811,11 +836,12 @@ function renderSidebar() {
     root,
     h("div", { class: "side-brand" }, h("span", { class: "side-logo", "aria-hidden": "true" }, h("span"), h("span"), h("span"), h("span")), "Bot Platform"),
     workspaceBar(),
+    h("button", { class: `side-search${state.view === "search" ? " on" : ""}`, type: "button", onclick: openSearch }, icon("search", 15), h("span", {}, "搜索对话、任务和文件"), h("kbd", {}, "⌘K")),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "群聊"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建群聊", title: "新建群聊", onclick: () => openGroupDialog() }, icon("plus", 16))),
     h("div", { class: "bot-list" }, groupRows.length ? groupRows : h("p", { class: "empty-hint" }, "把几个 Bot 拉进群聊，需要谁就 @ 谁。")),
     h("div", { class: "sidebar-head" }, h("span", { class: "brand" }, "Bots"), h("button", { class: "icon-btn", type: "button", "aria-label": "新建 Bot", title: "新建 Bot", onclick: () => openBotDialog() }, icon("plus", 16))),
     h("div", { class: "bot-list" }, rows.length ? rows : h("p", { class: "empty-hint" }, "还没有 Bot，先建一个。")),
-    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "project" ? " on" : ""}`, type: "button", onclick: openProject }, icon("folder", 16), "项目"), h("button", { class: `side-settings${state.view === "search" ? " on" : ""}`, type: "button", title: "⌘K 或 Ctrl+K", onclick: openSearch }, icon("search", 16), "搜索"), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", waitingCount() ? h("span", { class: "inbox-count", "aria-label": `${waitingCount()} 项待处理` }, String(waitingCount())) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
+    h("div", { class: "side-foot" }, quotaPanel(), h("button", { class: `side-settings${state.view === "project" ? " on" : ""}`, type: "button", onclick: openProject }, icon("folder", 16), "项目"), h("button", { class: `side-settings${state.view === "inbox" ? " on" : ""}`, type: "button", onclick: openInbox }, icon("inbox", 16), "待办", waitingCount() ? h("span", { class: "inbox-count", "aria-label": `${waitingCount()} 项待处理` }, String(waitingCount())) : null), h("button", { class: `side-settings${state.view === "tasks" ? " on" : ""}`, type: "button", onclick: openTasks }, icon("list", 16), "任务中心"), h("button", { class: `side-settings${state.view === "settings" ? " on" : ""}`, type: "button", onclick: openSettings }, icon("settings", 16), "设置")),
   );
 }
 
@@ -1159,6 +1185,10 @@ function renderMain({ scroll = false, focus = false }) {
   const root = $("main");
   const group = currentGroup();
   const bot = currentBot();
+  if (!state.bots.length && !state.groups.length) {
+    setChildren(root, onboarding());
+    return;
+  }
   if (!bot && !group) {
     setChildren(
       root,
@@ -1185,9 +1215,8 @@ function renderMain({ scroll = false, focus = false }) {
       h("button", { class: "icon-btn menu-btn", type: "button", "aria-label": "打开 Bot 列表", onclick: toggleSidebar }, icon("menu")),
       group ? h("span", { class: "group-avatar" }, groupMembers(group).slice(0, 4).map((m) => avatar(m.id, 15))) : avatar(bot.id, 32),
       h("div", { class: "chat-head-text" }, h("h1", {}, entity.name), h("p", {}, conv?.title ?? "新对话")),
-      h("span", { class: "chip" }, group ? `${group.members.length} 个成员` : `${AGENT_LABEL[bot.agent]} · ${modelLabel(bot.model)}`),
-      entity.research_enabled ? h("button", { class: "head-action", type: "button", onclick: openResearch }, icon("flask", 15), "实验") : null,
-      h("button", { class: "head-edit", type: "button", onclick: () => (group ? openGroupDialog(group) : openBotDialog(bot)) }, "编辑"),
+      h("button", { class: "head-pill", type: "button", title: group ? "编辑群聊" : "换模型、强度或职责", onclick: () => (group ? openGroupDialog(group) : openBotDialog(bot)) }, group ? `${group.members.length} 个成员` : [h("span", { class: "head-pill-agent" }, AGENT_LABEL[bot.agent]), modelLabel(bot.model), icon("chevron", 13)]),
+      entity.research_enabled ? h("button", { class: "head-pill", type: "button", onclick: openResearch }, icon("flask", 14), "实验") : null,
       h("button", { class: "icon-btn head-panel", type: "button", "aria-label": "显示或隐藏信息栏", title: "信息栏", onclick: toggleDetails }, icon("panel")),
     ),
     !state.connected ? h("div", { class: "banner warning", role: "status" }, "和守护进程的连接断开了，正在重连…") : null,
@@ -1201,6 +1230,60 @@ function renderMain({ scroll = false, focus = false }) {
   renderComposerState();
   if (focus && window.innerWidth > 720) $("composer-input")?.focus();
   void scroll;
+}
+
+// First run: show which agents this computer has, how to add the rest, and build a team from them.
+const AGENT_SETUP = {
+  claude: { install: "npm install -g @anthropic-ai/claude-code", login: "claude", note: "运行后按提示登录 Claude 账号" },
+  codex: { install: "npm install -g @openai/codex", login: "codex login", note: "用 ChatGPT 账号登录" },
+  grok: { install: null, login: "grok", note: "按 xAI 官网的说明安装 Grok CLI，再运行它登录" },
+  antigravity: { install: null, login: "agy", note: "安装 Antigravity 后，运行 agy 登录 Google 账号" },
+};
+
+function onboarding() {
+  const agents = state.agents ?? {};
+  const ready = Object.keys(AGENT_LABEL).filter((a) => agents[a]?.installed && agents[a]?.loggedIn);
+  const cmd = (text) => h("code", { class: "setup-cmd", title: "点击复制", onclick: () => navigator.clipboard?.writeText(text) }, text);
+  const recheck = async (e) => {
+    e.currentTarget.disabled = true;
+    try {
+      const r = await api("/api/agents/refresh", { method: "POST" });
+      state.agents = r.agents;
+      state.agentStatus = r.agents;
+      state.workspaceTemplates = r.workspace_templates;
+    } catch {}
+    renderMain({});
+  };
+  return h(
+    "div",
+    { class: "onboarding" },
+    h("h1", {}, "欢迎使用 Bot Platform"),
+    h("p", { class: "muted" }, "每个 Bot 都运行在你这台电脑上已登录的官方 agent 里，用的是你自己的订阅。先确认装了哪些，再一键建一个团队。"),
+    h(
+      "div",
+      { class: "setup-agents" },
+      Object.keys(AGENT_LABEL).map((a) => {
+        const s = agents[a];
+        const stateText = s?.installed ? (s.loggedIn ? `已就绪${s.version ? ` · ${s.version}` : ""}` : "已安装，未登录") : "未安装";
+        const tone = s?.installed ? (s.loggedIn ? "ok" : "warn") : "off";
+        const help = AGENT_SETUP[a];
+        return h(
+          "div",
+          { class: `setup-agent ${tone}` },
+          h("div", { class: "setup-agent-head" }, h("strong", {}, AGENT_LABEL[a]), h("span", { class: `setup-state ${tone}` }, stateText)),
+          tone === "ok" ? h("p", { class: "muted small" }, `可用模型：${(s.models ?? []).map(modelLabel).join("、")}`) : h("div", { class: "setup-help" }, help.install && !s?.installed ? cmd(help.install) : null, cmd(help.login), h("p", { class: "muted small" }, help.note)),
+        );
+      }),
+    ),
+    h(
+      "div",
+      { class: "setup-actions" },
+      h("button", { type: "button", onclick: recheck }, icon("refresh", 15), "重新检测"),
+      h("button", { type: "button", class: "primary", disabled: ready.length ? null : true, onclick: openWorkspaceDialog }, "创建第一个工作空间"),
+      h("button", { type: "button", disabled: ready.length ? null : true, onclick: () => openBotDialog() }, "只建一个 Bot"),
+    ),
+    h("p", { class: "muted small" }, ready.length ? `会按你已登录的 ${ready.map((a) => AGENT_LABEL[a]).join("、")} 分配团队成员，创建前还可以改。` : "至少需要一个已登录的 agent。装好后点“重新检测”。"),
+  );
 }
 
 function renderChatTitle() {
@@ -2244,6 +2327,7 @@ function renderDetails() {
   const root = $("details");
   const group = currentGroup();
   const b = currentBot();
+  $("app").classList.toggle("nothing-selected", !b && !group);
   if (!b && !group) {
     root.replaceChildren();
     return;
@@ -2283,6 +2367,7 @@ function renderDetails() {
     ...worktreeSection(),
     ...memorySection([["个人记忆", "bot", b.id, `${b.name} 的记忆`], ["项目记忆", "project", b.project_memory, `${b.name} 所在目录的项目记忆`]]),
     ...budgetSection(b),
+    ...routineSection({ h, api, bot: b, dlg: $("bot-dialog"), onJump: (convId) => selectBot(b.id, convId), onChanged: () => {} }),
     ...moduleSection(b),
     ...traceSection(),
     h("h2", { class: "section" }, "累计用量"),
@@ -2298,14 +2383,23 @@ function openBotDialog(bot, proposal) {
   const agents = Object.keys(AGENT_LABEL);
   const agentSel = h("select", { id: "f-agent", name: "agent" }, agents.map((a) => h("option", { value: a }, AGENT_LABEL[a])));
   const modelSel = h("select", { id: "f-model", name: "model", required: true });
+  // For a model newer than this list, or one only this person's plan has.
+  const customModel = h("input", { id: "f-model-custom", name: "model_custom", placeholder: "模型 ID，例如 claude-opus-6", maxlength: 80, hidden: true, "aria-label": "自定义模型" });
+  modelSel.addEventListener("change", () => {
+    customModel.hidden = modelSel.value !== "__custom";
+    customModel.required = !customModel.hidden;
+    if (!customModel.hidden) customModel.focus();
+  });
   const routeWrap = h("label", { class: "field", for: "f-route" }, "路由", h("select", { id: "f-route", name: "route" }, Object.entries(ROUTE_LABEL).map(([k, v]) => h("option", { value: k }, v))));
   const error = h("p", { class: "send-error", role: "alert", hidden: true });
   const fillModels = (selected) => {
     const list = state.agents[agentSel.value]?.models ?? [];
     const options = selected && !list.includes(selected) ? [...list, selected] : list;
     // Starts empty on purpose: which model a Bot runs on, and what it costs, should be a choice.
-    modelSel.replaceChildren(h("option", { value: "" }, "请选择模型"), ...options.map((m) => h("option", { value: m }, modelLabel(m))));
+    modelSel.replaceChildren(h("option", { value: "" }, "请选择模型"), ...options.map((m) => h("option", { value: m }, modelLabel(m))), h("option", { value: "__custom" }, "其他模型…"));
     modelSel.value = selected ?? "";
+    customModel.hidden = true;
+    customModel.required = false;
     routeWrap.hidden = agentSel.value !== "codex";
   };
   agentSel.value = src?.agent ?? state.settings?.default_agent ?? "claude";
@@ -2318,6 +2412,8 @@ function openBotDialog(bot, proposal) {
         e.preventDefault();
         const f = new FormData(form);
         const body = Object.fromEntries([...f.entries()].filter(([k]) => k !== "cc"));
+        if (body.model === "__custom") body.model = String(body.model_custom ?? "").trim();
+        delete body.model_custom;
         if (body.agent !== "codex") delete body.route;
         const others = hereBots().filter((x) => x.id !== bot?.id);
         const picked = f.getAll("cc");
@@ -2361,7 +2457,7 @@ function openBotDialog(bot, proposal) {
       bot?.is_chief ? h("button", { type: "button", onclick: () => ($("f-role").value = state.chiefDefaultRole) }, "恢复默认") : null,
       h("span", { id: "f-refine-note", class: "muted small", role: "status" }),
     ),
-    h("div", { class: "field-row" }, h("label", { class: "field", for: "f-agent" }, "底层 agent", agentSel), h("label", { class: "field", for: "f-model" }, "模型", modelSel)),
+    h("div", { class: "field-row" }, h("label", { class: "field", for: "f-agent" }, "底层 agent", agentSel), h("label", { class: "field", for: "f-model" }, "模型", modelSel, customModel)),
     h(
       "div",
       { class: "field-row" },

@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { summarize } from "./research.ts";
 import { search } from "./search.ts";
-import { createWorkspace, listWorkspaces, WORKSPACE_TEMPLATES } from "./workspaces.ts";
+import { createWorkspace, listWorkspaces, templatesFor, type AgentStatusMap } from "./workspaces.ts";
 import { MAX_UPLOAD } from "./artifacts.ts";
 import type { Pack } from "./exporter.ts";
 import { createReadStream, rmSync } from "node:fs";
@@ -15,7 +15,7 @@ import { Engine, HttpError, STEERABLE } from "./engine.ts";
 import { Memory, type MemoryScope } from "./git.ts";
 import { agentEnv } from "./adapters/process.ts";
 import type { Store } from "./store.ts";
-import { MODELS, type AgentKind, type ApprovalDecision, type Bot, type Group, type RuntimeFactory } from "./types.ts";
+import { MODELS, MODEL_ID, validModel, type AgentKind, type ApprovalDecision, type Bot, type Group, type RuntimeFactory } from "./types.ts";
 
 const MAX_BODY = 512 * 1024;
 const MAX_MESSAGE = 200_000;
@@ -31,6 +31,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/inbox.js": { file: "inbox.js", type: "text/javascript; charset=utf-8" },
   "/drafts.js": { file: "drafts.js", type: "text/javascript; charset=utf-8" },
   "/search.js": { file: "search.js", type: "text/javascript; charset=utf-8" },
+  "/routines.js": { file: "routines.js", type: "text/javascript; charset=utf-8" },
   "/artifacts.js": { file: "artifacts.js", type: "text/javascript; charset=utf-8" },
   "/project.js": { file: "project.js", type: "text/javascript; charset=utf-8" },
   "/calls.js": { file: "calls.js", type: "text/javascript; charset=utf-8" },
@@ -43,6 +44,17 @@ const exec = (cmd: string, args: string[]) =>
     execFile(cmd, args, { env: agentEnv(), timeout: 15000 }, (e, stdout, stderr) => res({ ok: !e, out: `${stdout}${stderr}` }));
   });
 
+// What this person's own CLI says it can run, so the pickers match their plan rather than ours.
+export function listedModels(out: string, agent: "grok" | "antigravity"): string[] {
+  const ids =
+    agent === "grok"
+      ? [...out.matchAll(/^\s*[*-]\s+([A-Za-z0-9][\w.\/-]*)/gm)].map((m) => m[1])
+      : // Antigravity lists each model once per effort level; the effort is chosen separately.
+        [...out.matchAll(/^([A-Za-z0-9][\w.\/-]*?)-(?:low|medium|high)\t/gm)].map((m) => m[1]);
+  const found = [...new Set(ids)].filter((id) => MODEL_ID.test(id));
+  return found.length ? found : MODELS[agent];
+}
+
 export async function agentStatus() {
   const [cv, cl, xv, xl, gv, gl, av, al] = await Promise.all([exec("claude", ["--version"]), exec("claude", ["auth", "status"]), exec("codex", ["--version"]), exec("codex", ["login", "status"]), exec("grok", ["--version"]), exec("grok", ["models"]), exec("agy", ["--version"]), exec("agy", ["models"])]);
   let claudeIn = false;
@@ -52,8 +64,8 @@ export async function agentStatus() {
   return {
     claude: { installed: cv.ok, loggedIn: claudeIn, version: cv.ok ? cv.out.trim().split(" ")[0] : null, models: MODELS.claude },
     codex: { installed: xv.ok, loggedIn: xl.ok && /logged in/i.test(xl.out), version: xv.ok ? xv.out.trim().split(" ").pop() : null, models: MODELS.codex },
-    grok: { installed: gv.ok, loggedIn: gl.ok && /logged in/i.test(gl.out), version: gv.ok ? gv.out.trim().split(" ")[1] : null, models: MODELS.grok },
-    antigravity: { installed: av.ok, loggedIn: al.ok && /gemini/i.test(al.out), version: av.ok ? av.out.trim() : null, models: MODELS.antigravity },
+    grok: { installed: gv.ok, loggedIn: gl.ok && /logged in/i.test(gl.out), version: gv.ok ? gv.out.trim().split(" ")[1] : null, models: gl.ok ? listedModels(gl.out, "grok") : MODELS.grok },
+    antigravity: { installed: av.ok, loggedIn: al.ok && /gemini|claude|gpt/i.test(al.out), version: av.ok ? av.out.trim() : null, models: al.ok ? listedModels(al.out, "antigravity") : MODELS.antigravity },
   };
 }
 
@@ -124,7 +136,9 @@ async function validateBot(input: any, existing?: Bot, defaults: AppSettings = S
   oneOf("route", ["official", "gateway"]);
   if (input.model !== undefined) {
     // The value becomes a command-line argument, so it must not be able to look like a flag.
-    if (typeof input.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._\/-]{0,79}$/.test(input.model)) throw new HttpError(400, "模型名称无效");
+    if (typeof input.model !== "string" || !MODEL_ID.test(input.model)) throw new HttpError(400, "模型名称无效");
+    const agent = input.agent ?? existing?.agent;
+    if (agent && !validModel(agent, input.model)) throw new HttpError(400, `模型 ${input.model} 不属于 ${agent}`);
     out.model = input.model;
   }
   if (out.cwd) {
@@ -245,7 +259,7 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
   let quotaCache: { at: number; value: Promise<QuotaReport> } | null = null;
   const refine = o.refine ?? refineRole;
 
-  const botView = (b: Bot) => ({ ...b, call_count: o.store.callCountTo(b.id), research_enabled: Boolean(engine.research.settings(Memory.projectId(b.cwd)).enabled), can_call: b.can_call ? JSON.parse(b.can_call) : null, usage: o.store.botUsage(b.id), conversations: o.store.listConversations(b.id), project_memory: Memory.projectId(b.cwd) });
+  const botView = (b: Bot) => ({ ...b, call_count: o.store.callCountTo(b.id), research_enabled: Boolean(engine.research.settings(Memory.projectId(b.cwd)).enabled), can_call: b.can_call ? JSON.parse(b.can_call) : null, usage: o.store.botUsage(b.id), routines: engine.routines.list(b.id), conversations: o.store.listConversations(b.id), project_memory: Memory.projectId(b.cwd) });
   const groupView = (g: Group) => ({ ...g, research_enabled: Boolean(engine.research.settings(Memory.projectId(g.cwd)).enabled), members: o.store.groupMembers(g.id).map((m) => m.id), conversations: o.store.listGroupConversations(g.id), project_memory: Memory.projectId(g.cwd) });
 
   const validateGroup = async (input: any, existing?: Group) => {
@@ -305,7 +319,11 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
     }
     if (parts[0] !== "api") throw new HttpError(404, "Not found");
 
-    if (m === "GET" && pathname === "/api/state") return json(res, 200, { workspaces: listWorkspaces(o.store), workspace_templates: WORKSPACE_TEMPLATES.map(({ role: _role, ...t }) => t), steerable: STEERABLE, settings: o.store.settings(), bots: o.store.listBots().map(botView), groups: o.store.listGroups().map(groupView), agents: await status(), chief_default_role: CHIEF_ROLE });
+    if (m === "POST" && pathname === "/api/agents/refresh") {
+      statusCache = null;
+      return json(res, 200, { agents: await status(), workspace_templates: templatesFor((await status()) as AgentStatusMap) });
+    }
+    if (m === "GET" && pathname === "/api/state") return json(res, 200, { workspaces: listWorkspaces(o.store), workspace_templates: templatesFor((await status()) as AgentStatusMap), steerable: STEERABLE, settings: o.store.settings(), bots: o.store.listBots().map(botView), groups: o.store.listGroups().map(groupView), agents: await status(), chief_default_role: CHIEF_ROLE });
     if (pathname === "/api/settings") {
       if (m === "GET") return json(res, 200, { settings: o.store.settings(), home: o.store.home });
       if (m === "PUT") {
@@ -370,6 +388,19 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
         engine.archiveGroup(cur.id);
         return json(res, 200, { ok: true });
       }
+    }
+    if (parts[1] === "bots" && parts[2] && parts[3] === "routines" && !parts[4]) {
+      if (m === "GET") return json(res, 200, { routines: engine.routines.list(parts[2]) });
+      if (m === "POST") return json(res, 201, engine.routines.create(parts[2], await readJson(req)));
+    }
+    if (m === "GET" && pathname === "/api/routines") return json(res, 200, { routines: engine.routines.list() });
+    if (parts[1] === "routines" && parts[2]) {
+      if (m === "PATCH" && !parts[3]) return json(res, 200, engine.routines.update(parts[2], await readJson(req)));
+      if (m === "DELETE" && !parts[3]) {
+        engine.routines.remove(parts[2]);
+        return json(res, 200, { ok: true });
+      }
+      if (m === "POST" && parts[3] === "run") return json(res, 200, await engine.routines.runNow(parts[2]));
     }
     if (m === "GET" && parts[1] === "bots" && parts[3] === "calls") {
       if (!o.store.getBot(parts[2])) throw new HttpError(404, "Bot 不存在");

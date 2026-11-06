@@ -2,12 +2,13 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join, extname, resolve } from "node:path";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { BUS_TOOLS, CHIEF_TOOLS, MODELS, RESEARCH_TOOLS, type AgentEvent, type AgentKind, type AgentRuntime, type ApprovalDecision, type Bot, type Conversation, type Group, type Item, type RuntimeFactory, type TurnStatus } from "./types.ts";
+import { BUS_TOOLS, CHIEF_TOOLS, RESEARCH_TOOLS, validModel, type AgentEvent, type AgentKind, type AgentRuntime, type ApprovalDecision, type Bot, type Conversation, type Group, type Item, type RuntimeFactory, type TurnStatus } from "./types.ts";
 import { HttpError } from "./errors.ts";
 import { Memory, Worktrees, type MemoryScope, type Worktree, changedSince, git, workState, type WorkState, diffWithNewFiles, type ChangedFile } from "./git.ts";
 import { Artifacts } from "./artifacts.ts";
 import { Projects } from "./projects.ts";
 import { Exporter } from "./exporter.ts";
+import { describeSchedule, Routines } from "./routines.ts";
 import { Research } from "./research.ts";
 import type { Store } from "./store.ts";
 
@@ -239,6 +240,7 @@ export class Engine {
   readonly artifacts: Artifacts;
   readonly projects: Projects;
   readonly exporter: Exporter;
+  readonly routines: Routines;
   // Conversations with something to send, held back only because no slot is free.
   private readonly slotWaiters = new Set<string>();
   private readonly budgetWarned = new Set<string>();
@@ -263,6 +265,18 @@ export class Engine {
     this.research = new Research({ store: o.store, broadcast: o.broadcast, onFinished: (e) => this.onExperimentFinished(e), pollMs: o.pollMs, sshPollMs: o.sshPollMs });
     this.fixedIdleMs = o.idleMs;
     this.exporter = new Exporter({ store: o.store, memory: this.memory, research: this.research, projects: this.projects });
+    this.routines = new Routines({
+      store: o.store,
+      fire: async (r) => {
+        const bot = this.store.getBot(r.bot_id)!;
+        const prev = r.conv_id ? this.store.getConversation(r.conv_id) : undefined;
+        const usable = prev && prev.kind === "direct" && prev.bot_id === r.bot_id && prev.agent === bot.agent ? prev : undefined;
+        if (usable?.status === "running") throw new Error("上一次还没结束，这次跳过");
+        const conv = await this.sendMessage(r.bot_id, usable?.id ?? null, `[定时任务「${r.name}」自动发出]\n${r.prompt}`);
+        return { convId: conv.id };
+      },
+      onChange: (routine, botId, id) => this.broadcast({ type: "routine", botId, id, routine }),
+    });
     this.reaper = setInterval(() => this.reapIdle(), Math.min(o.idleMs ?? 30000, 30000));
     this.reaper.unref();
     for (const convId of this.store.recover()) {
@@ -273,6 +287,7 @@ export class Engine {
   shutdown() {
     this.closed = true;
     clearInterval(this.reaper);
+    this.routines.close();
     // Running jobs are detached on purpose: they keep going and are picked up after the restart.
     this.research.stop();
     for (const root of this.roots.values()) {
@@ -1451,9 +1466,31 @@ export class Engine {
       case "propose_plan":
         if (!l.bot.is_chief) return { text: "只有 Chief 可以提出执行计划", isError: true };
         return this.proposePlan(l, ctx, args);
+      case "routine":
+        return this.routineTool(l, ctx, args);
       default:
         return { text: `没有工具 ${tool}`, isError: true };
     }
+  }
+
+  private routineTool(l: Live, ctx: TurnCtx, args: any): CallResult {
+    const mine = this.routines.list(l.bot.id);
+    if (args?.action === "list") {
+      return { text: mine.map((r) => `- ${r.id}｜${r.name}｜${describeSchedule(r)}｜${r.enabled ? "开启" : "已关闭"}${r.last_status ? `｜上次：${r.last_status}` : ""}`).join("\n") || "你还没有定时任务", isError: false };
+    }
+    if (args?.action === "cancel") {
+      const r = mine.find((x) => x.id === args.id);
+      if (!r) return { text: "没有这个定时任务，或它不是你的", isError: true };
+      this.routines.update(r.id, { enabled: false });
+      this.addItem(ctx.displayConvId, null, "notice", "done", { text: `${l.bot.name} 关闭了定时任务「${r.name}」`, local: true });
+      return { text: `已关闭「${r.name}」`, isError: false };
+    }
+    if (args?.action !== "create") return { text: "action 只能是 create、list 或 cancel", isError: true };
+    const display = this.store.getConversation(ctx.displayConvId);
+    const convId = display?.kind === "direct" && display.bot_id === l.bot.id ? display.id : undefined;
+    const r = this.routines.create(l.bot.id, { ...args, conv_id: convId }, "bot");
+    this.addItem(ctx.displayConvId, null, "notice", "done", { text: `${l.bot.name} 新建了定时任务「${r.name}」：${describeSchedule(r)}。可以在 ${l.bot.name} 的详情 → 定时任务 里修改、暂停或删除。`, local: true });
+    return { text: `已创建「${r.name}」（${describeSchedule(r)}），id ${r.id}。下次运行：${new Date(r.next_run!).toLocaleString("zh-CN")}`, isError: false };
   }
 
   // ---------- plans the person can edit before anything runs ----------
@@ -1547,7 +1584,7 @@ export class Engine {
     if (tool === "create_bot" && this.peers(l.bot).length >= MAX_BOTS) return { text: `Bot 数量已达上限 ${MAX_BOTS}`, isError: true };
     const spec = pick(args);
     if (!existing && !spec.model) return { text: "新建 Bot 必须指定 model", isError: true };
-    if (spec.model && !MODELS[(spec.agent ?? existing?.agent) as AgentKind]?.includes(spec.model)) return { text: `模型 ${spec.model} 不属于这个 agent`, isError: true };
+    if (spec.model && !validModel(String(spec.agent ?? existing?.agent), spec.model)) return { text: `模型 ${spec.model} 不属于这个 agent`, isError: true };
     if (spec.name && this.peers(l.bot).some((b) => b.id !== existing?.id && b.name.toLowerCase() === String(spec.name).trim().toLowerCase())) return { text: `已经有叫 ${spec.name} 的 Bot`, isError: true };
     try {
       await this.validateBot(spec, existing);

@@ -94,6 +94,23 @@ const tools = [
   },
   { name: "pause_bot", description: "暂停某个 Bot，暂停后其他 Bot 不能调用它。只有用户能恢复。", inputSchema: { type: "object", properties: { bot }, required: ["bot"] } },
   {
+    name: "routine",
+    description: "管理你自己的定时任务：到点后平台会把 prompt 当作新消息发给你。用于用户要求“每小时检查训练”“每个工作日 9 点汇总”这类事。create 要给 every_minutes（至少 15）或 daily_at（如 09:00，可加 weekdays，0 是周日）；list 列出；cancel 按 id 关闭。用户没要求时不要创建。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["create", "list", "cancel"] },
+        name: { type: "string" },
+        prompt: { type: "string", description: "到点时发给你自己的内容，要写清楚检查什么、什么情况算异常" },
+        every_minutes: { type: "number" },
+        daily_at: { type: "string" },
+        weekdays: { type: "array", items: { type: "number" } },
+        id: { type: "string" },
+      },
+      required: ["action"],
+    },
+  },
+  {
     name: "get_task",
     description: "查询 assign_task 的结果。wait_seconds 可让它最多等待这么多秒（上限 300）再返回，比反复查询省额度。",
     inputSchema: { type: "object", properties: { task_id: { type: "string" }, wait_seconds: { type: "number" } }, required: ["task_id"] },

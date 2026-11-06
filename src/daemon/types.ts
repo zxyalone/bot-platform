@@ -116,6 +116,15 @@ export const MODELS: Record<AgentKind, string[]> = {
   antigravity: ["gemini-4-argon", "gemini-3.8-flash"],
 };
 
-export const BUS_TOOLS = ["list_bots", "ask_bot", "assign_task", "get_task", "remember", "recall"];
+// Any model the person's own CLI accepts. It becomes one argv entry, so it must not look like a flag.
+export const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,79}$/;
+// A model another vendor's CLI is known to run is a mistake, not a custom choice. Antigravity hosts several vendors.
+export const validModel = (agent: string, model: unknown) =>
+  agent in MODELS &&
+  typeof model === "string" &&
+  MODEL_ID.test(model) &&
+  (agent === "antigravity" || MODELS[agent as AgentKind].includes(model) || !Object.entries(MODELS).some(([a, list]) => a !== agent && a !== "antigravity" && list.includes(model)));
+
+export const BUS_TOOLS = ["list_bots", "ask_bot", "assign_task", "get_task", "remember", "recall", "routine"];
 export const RESEARCH_TOOLS = ["add_idea", "update_idea", "list_ideas", "run_experiment", "list_experiments", "get_experiment"];
 export const CHIEF_TOOLS = ["create_bot", "update_bot", "pause_bot", "propose_plan"];

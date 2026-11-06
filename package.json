@@ -9,5 +9,6 @@
     "demo": "node --disable-warning=ExperimentalWarning test/demo-daemon.ts",
     "test": "node --disable-warning=ExperimentalWarning --test --test-force-exit --test-timeout=60000 --test-reporter=spec test/unit/*.test.ts",
     "test:live": "node --disable-warning=ExperimentalWarning --test --test-force-exit --test-reporter=spec test/live/*.test.ts"
-  }
+  },
+  "bin": { "botctl": "bin/botctl.mjs" }
 }

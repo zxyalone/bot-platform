@@ -142,11 +142,11 @@ test("refuses self-calls, unknown names, empty questions, and calls not on the a
   s.t.close();
 });
 
-test("a Bot that may call nobody keeps only its memory tools", async () => {
+test("a Bot that may call nobody keeps only its own tools: memory and routines", async () => {
   const s = await setup(["A", "B"], { can_call: [] });
   await s.say("A");
   const a = await s.waitRt("A");
-  assert.equal(a.opts.bus!.env.BUS_TOOLS, "remember,recall");
+  assert.equal(a.opts.bus!.env.BUS_TOOLS, "remember,recall,routine");
   s.t.close();
 });
 

@@ -8,7 +8,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..", "..");
 const port = Number(process.env.PORT || 4317);
 const store = new Store(process.env.BOT_PLATFORM_HOME || join(root, ".data"));
-ensureSeedBots(store);
+// A new install starts empty and the first screen builds a team from the agents this person has.
+// Older databases keep their seeded Bots and get role upgrades.
+if (store.listBots().length) ensureSeedBots(store);
 
 const app = createApp({ store, factory: realFactory, webDir: join(root, "src", "web"), port: () => port });
 // Loopback only: this API can start agents with access to the user's files and accounts.
