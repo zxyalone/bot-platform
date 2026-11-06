@@ -282,3 +282,7 @@ Claude Code 和 Codex 可以点“立即补充”（⌘/Ctrl + Enter），把消
 ```json
 {"cases": [{"id": "case-1", "image": "cases/1_img.png", "label": "cases/1_gt.png", "pred": "cases/1_pred.png", "metrics": {"dice": 0.72}}]}
 ```
+
+## 许可证
+
+[MIT](LICENSE)
