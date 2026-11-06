@@ -141,25 +141,23 @@ Scripted agents and a throwaway data folder. Send the Chief “派任务” to w
 
 ```mermaid
 flowchart LR
-    subgraph ui ["Web UI or Mac app"]
-        A[Chats · plans · task center · result cards]
+    UI["Web UI / Mac app"] <-- "HTTP + SSE" --> ENG
+    subgraph daemon ["Daemon · 127.0.0.1"]
+        ENG["Engine<br/>rounds · budgets · approvals"]
+        BUS["Bot bus (MCP)<br/>ask_bot · assign_task · routine"]
+        DB[("SQLite + Git memory")]
+        BUS --> ENG
+        ENG --- DB
     end
-    subgraph daemon ["Daemon on 127.0.0.1:4317"]
-        E[Engine: rounds, budgets, approvals]
-        B[Bot bus: ask_bot · assign_task · routine …]
-        S[(SQLite + Git memory)]
-    end
+    ENG -- spawns --> agents
     subgraph agents ["Official CLIs on your machine"]
-        C[claude · stream-json]
-        X[codex · app-server]
-        G[grok · ACP]
-        Y[agy · ACP]
+        direction TB
+        C["Claude Code"]
+        X["Codex"]
+        G["Grok Build"]
+        Y["Antigravity"]
     end
-    A -- HTTP --> E
-    E -- SSE --> A
-    E --> C & X & G & Y
-    C & X & G & Y -- MCP tools --> B --> E
-    E --- S
+    agents -- "tool calls" --> BUS
 ```
 
 The daemon owns every agent process and normalizes four native protocols into one event stream. Bots talk to each other through a small MCP server (the **bot bus**), so every delegation passes through the engine, where it is checked for loops, depth, call count, concurrency and budget before it runs.

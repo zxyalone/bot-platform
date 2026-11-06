@@ -141,25 +141,23 @@ npm run demo
 
 ```mermaid
 flowchart LR
-    subgraph ui ["网页或 Mac App"]
-        A[对话 · 计划 · 任务中心 · 结果卡片]
+    UI["网页 / Mac App"] <-- "HTTP + SSE" --> ENG
+    subgraph daemon ["守护进程 · 127.0.0.1"]
+        ENG["引擎<br/>回合 · 预算 · 审批"]
+        BUS["Bot 总线（MCP）<br/>ask_bot · assign_task · routine"]
+        DB[("SQLite + Git 记忆")]
+        BUS --> ENG
+        ENG --- DB
     end
-    subgraph daemon ["守护进程 127.0.0.1:4317"]
-        E[引擎：回合、预算、审批]
-        B[Bot 总线：ask_bot · assign_task · routine …]
-        S[(SQLite + Git 记忆)]
-    end
+    ENG -- 启动 --> agents
     subgraph agents ["你电脑上的官方命令行"]
-        C[claude · stream-json]
-        X[codex · app-server]
-        G[grok · ACP]
-        Y[agy · ACP]
+        direction TB
+        C["Claude Code"]
+        X["Codex"]
+        G["Grok Build"]
+        Y["Antigravity"]
     end
-    A -- HTTP --> E
-    E -- SSE --> A
-    E --> C & X & G & Y
-    C & X & G & Y -- MCP 工具 --> B --> E
-    E --- S
+    agents -- 工具调用 --> BUS
 ```
 
 守护进程管理所有 agent 进程，把四种原生协议统一成一条事件流。Bot 之间通过一个小型 MCP 服务（**Bot 总线**）通信，所以每一次派活都要经过引擎：先检查是否成环、深度、调用次数、并发和预算，才会真正执行。
