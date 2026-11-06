@@ -20,10 +20,10 @@ export const WORKSPACE_TEMPLATES = [
 
 // Who fills each seat when its first choice is not installed here, cheapest sensible model first.
 const PREFER: Record<string, [AgentKind, string][]> = {
-  chief: [["claude", "claude-sonnet-5-5"], ["codex", "gpt-6.1-terra"], ["antigravity", "gemini-4-argon"], ["grok", "grok-4.7"]],
-  engineer: [["codex", "gpt-6.1-terra"], ["claude", "claude-sonnet-5-5"], ["grok", "grok-4.7-build-fast"], ["antigravity", "gemini-4-argon"]],
-  reviewer: [["claude", "claude-sonnet-5-5"], ["codex", "gpt-6-astra"], ["antigravity", "gemini-4-argon"], ["grok", "grok-4.7"]],
-  scholar: [["antigravity", "gemini-3.8-flash"], ["grok", "grok-4.7-build-fast"], ["claude", "claude-haiku-5-5"], ["codex", "gpt-6-luna"]],
+  chief: [["claude", "claude-sonnet-5-5"], ["codex", "gpt-6.1-terra"], ["antigravity", "gemini-4-argon"], ["grok", "grok-4.7"], ["dsh", "deepseek-account/deepseek-v4-pro"]],
+  engineer: [["codex", "gpt-6.1-terra"], ["claude", "claude-sonnet-5-5"], ["grok", "grok-4.7-build-fast"], ["antigravity", "gemini-4-argon"], ["dsh", "deepseek-account/deepseek-v4-pro"]],
+  reviewer: [["claude", "claude-sonnet-5-5"], ["codex", "gpt-6-astra"], ["antigravity", "gemini-4-argon"], ["grok", "grok-4.7"], ["dsh", "deepseek-account/deepseek-v4-pro"]],
+  scholar: [["antigravity", "gemini-3.8-flash"], ["grok", "grok-4.7-build-fast"], ["claude", "claude-haiku-5-5"], ["codex", "gpt-6-luna"], ["dsh", "deepseek-account/deepseek-flash"]],
 };
 
 export type AgentStatusMap = Record<string, { installed: boolean; loggedIn: boolean; models: string[] } | undefined>;

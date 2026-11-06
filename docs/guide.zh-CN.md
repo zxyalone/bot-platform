@@ -88,6 +88,16 @@ npm run test:live
 - Grok Build 和 Antigravity 走 ACP，权限由平台统一判断：只读模式拒绝一切写入和命令，未知类型的工具按写入处理。它们的角色说明随每次启动后的第一条消息发送。用量要到一轮结束才知道，所以这两家的预算只能在一轮结束后检查，不能中途打断。
 - 费用是 agent 上报的估算值。使用订阅时不一定等于实际扣费。
 
+## DeepSeek（dsh）
+
+通过 DeepSeek Harness 的命令行 `dsh` 接入，协议和 Grok、Antigravity 一样是 ACP。平台会在 PATH 里找 `dsh`，找不到时用 `/Applications/DeepSeek Harness.app` 里自带的那个。
+
+- **两种用法：** dsh 里登录 DeepSeek 账号，或者填 DeepSeek API key，平台都能用。模型名写成 `提供方/模型`，例如 `deepseek-account/deepseek-v4-pro`（账号）和 `deepseek-official/deepseek-v4-pro`（API key），界面上显示为“V4 Pro · 账号”“V4 Pro · API”。列表是平台启动 dsh 握手时读到的，只列出你这台电脑上 dsh 已经配好的那些，握手不会调用模型。
+- **强度：** 低、中、高分别对应 dsh 的 low、high、max。
+- **不经平台审批：** 实测 dsh 会直接写文件、运行命令，不向平台请求批准，只读 Bot 也一样。平台启动它时总会设置 `DSH_PERMISSION_MODE`（只读 Bot 用 `read-only`，其余用 `workspace-write`），但在我们测试的那份 dsh 上这个设置没有生效。所以对 DeepSeek Bot：权限选项和审批卡片都不起作用；派给它的后台任务（`assign_task` 和执行计划里的步骤）默认放进独立的 Git 工作树，合并前请在结果卡片里看改动；目录还不是有提交的 Git 仓库时，任务直接在原目录运行；私聊和 `ask_bot` 提问仍在原目录运行，不会隔离。
+- **用量：** dsh 不报告 token 数，只报告每次请求后上下文有多大。平台把这些读数加起来当作输入，把其中最大的一次当作未缓存部分，输出记为 0。这只是估算，预算会按它计算，可能和 DeepSeek 实际扣费不同。
+- **会话：** dsh 支持恢复会话，进程空闲回收后会接着原来的会话。
+
 ## 导出、备份和恢复
 
 - **导出对话：** 右侧面板，生成 Markdown。工具调用只列名称和状态，不含输入输出；Bot 之间调用的中间过程只留问题和回答。

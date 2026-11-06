@@ -3,7 +3,7 @@ import { icon } from "./icons.js";
 
 const ACCENTS = [["indigo", "靛蓝"], ["violet", "紫"], ["teal", "青"], ["green", "绿"], ["amber", "琥珀"], ["rose", "玫红"]];
 const TABS = [["appearance", "外观"], ["defaults", "新建默认值"], ["limits", "运行限制"], ["agents", "Agent 与额度"], ["targets", "计算目标"], ["data", "数据"]];
-const LOGIN_HINT = { claude: "claude auth login", codex: "codex login", grok: "grok login", antigravity: "agy acp --login" };
+const LOGIN_HINT = { claude: "claude auth login", codex: "codex login", grok: "grok login", antigravity: "agy acp --login", dsh: "在 DeepSeek Harness 里登录账号或填 API key" };
 
 export function mountSettings(root, ctx) {
   const { api, h, onBack, applyAppearance, agentLabel, permissionLabel, getAgents, getQuota, refreshQuota, resetLabel } = ctx;

@@ -6,15 +6,15 @@
 
 **A local-first workbench for running a team of AI coding agents — on the subscriptions you already pay for.**
 
-Give Claude Code, Codex, Grok Build and Antigravity names and roles, put a Chief in charge,<br>
+Give Claude Code, Codex, Grok Build, Antigravity and DeepSeek names and roles, put a Chief in charge,<br>
 and watch them split the work, review each other and report back — all on your own machine.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-3b82f6)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS-111111?logo=apple&logoColor=white)
 ![Node](https://img.shields.io/badge/node-%E2%89%A5%2022.18-5fa04e?logo=nodedotjs&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/npm%20dependencies-0-8b5cf6)
-![Tests](https://img.shields.io/badge/tests-308%20passing-22c55e)
-![Agents](https://img.shields.io/badge/agents-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Grok%20%C2%B7%20Antigravity-d97757)
+![Tests](https://img.shields.io/badge/tests-313%20passing-22c55e)
+![Agents](https://img.shields.io/badge/agents-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Grok%20%C2%B7%20Antigravity%20%C2%B7%20DeepSeek-d97757)
 
 [Quick start](#quick-start) · [Features](#features) · [How it works](#how-it-works) · [Full guide (中文)](docs/guide.zh-CN.md) · [中文 README](README.zh-CN.md)
 
@@ -128,6 +128,9 @@ npm start                       # → http://127.0.0.1:4317
 | Codex | `npm install -g @openai/codex` | `codex login` |
 | Grok Build | see xAI's CLI docs | `grok` |
 | Antigravity | see Google's Antigravity docs | `agy` |
+| DeepSeek (dsh) | install the DeepSeek Harness app | sign in to a DeepSeek account, or add a DeepSeek API key, in the app |
+
+> **DeepSeek note.** dsh runs its own tools without asking the platform first, so approvals and read-only do not bind DeepSeek Bots. Background tasks for them go into their own Git worktree by default, so you review the diff before merging. Each model is offered for both sign-in methods, e.g. *V4 Pro · 账号* (account) and *V4 Pro · API* (API key). Token usage is estimated from dsh's context readings.
 
 ### Try it without spending tokens
 
@@ -156,6 +159,7 @@ flowchart LR
         X["Codex"]
         G["Grok Build"]
         Y["Antigravity"]
+        D["DeepSeek (dsh)"]
     end
     agents -- "tool calls" --> BUS
 ```
@@ -198,7 +202,7 @@ npm run test:live               # real agents on each vendor's cheapest model
 
 | Path | What lives there |
 |---|---|
-| `src/daemon/adapters/` | Claude stream-json, Codex app-server and ACP (Grok, Antigravity) adapters |
+| `src/daemon/adapters/` | Claude stream-json, Codex app-server and ACP (Grok, Antigravity, DeepSeek dsh) adapters |
 | `src/daemon/engine.ts` | Rounds, calls, approvals, budgets, recovery |
 | `src/daemon/server.ts` | Local HTTP API and event stream |
 | `src/web/` | The UI: plain ES modules, no build step |

@@ -6,15 +6,15 @@
 
 **在自己电脑上指挥一支 AI 编程团队，用的是你已经付费的订阅。**
 
-给 Claude Code、Codex、Grok Build 和 Antigravity 起名字、分角色，让 Chief 统筹，<br>
+给 Claude Code、Codex、Grok Build、Antigravity 和 DeepSeek 起名字、分角色，让 Chief 统筹，<br>
 看它们拆分任务、互相审查、汇报结果。一切都在你的电脑上完成。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-3b82f6)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS-111111?logo=apple&logoColor=white)
 ![Node](https://img.shields.io/badge/node-%E2%89%A5%2022.18-5fa04e?logo=nodedotjs&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/npm%20dependencies-0-8b5cf6)
-![Tests](https://img.shields.io/badge/tests-308%20passing-22c55e)
-![Agents](https://img.shields.io/badge/agents-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Grok%20%C2%B7%20Antigravity-d97757)
+![Tests](https://img.shields.io/badge/tests-313%20passing-22c55e)
+![Agents](https://img.shields.io/badge/agents-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Grok%20%C2%B7%20Antigravity%20%C2%B7%20DeepSeek-d97757)
 
 [快速开始](#快速开始) · [功能](#功能) · [工作原理](#工作原理) · [完整使用指南](docs/guide.zh-CN.md) · [English](README.md)
 
@@ -128,6 +128,9 @@ npm start                       # 打开 http://127.0.0.1:4317
 | Codex | `npm install -g @openai/codex` | `codex login` |
 | Grok Build | 见 xAI 的命令行文档 | `grok` |
 | Antigravity | 见 Google 的 Antigravity 文档 | `agy` |
+| DeepSeek（dsh） | 安装 DeepSeek Harness 应用 | 在应用里登录 DeepSeek 账号，或填入 DeepSeek API key |
+
+> **关于 DeepSeek：** dsh 自己执行工具，不经平台审批，所以权限设置和只读对 DeepSeek Bot 无效。派给它的后台任务默认放进独立的 Git 工作树，合并前你可以先看改动。每个模型分账号和 API 两种用法，比如“V4 Pro · 账号”和“V4 Pro · API”。用量是根据 dsh 上报的上下文大小估算的。
 
 ### 不花 token 先试试
 
@@ -156,6 +159,7 @@ flowchart LR
         X["Codex"]
         G["Grok Build"]
         Y["Antigravity"]
+        D["DeepSeek（dsh）"]
     end
     agents -- 工具调用 --> BUS
 ```
@@ -198,7 +202,7 @@ npm run test:live               # 调用真实 agent，每家用最便宜的模�
 
 | 路径 | 内容 |
 |---|---|
-| `src/daemon/adapters/` | Claude stream-json、Codex app-server 和 ACP（Grok、Antigravity）适配器 |
+| `src/daemon/adapters/` | Claude stream-json、Codex app-server 和 ACP（Grok、Antigravity、DeepSeek dsh）适配器 |
 | `src/daemon/engine.ts` | 回合、调用、审批、预算、恢复 |
 | `src/daemon/server.ts` | 本机 HTTP 接口和事件流 |
 | `src/web/` | 界面：原生 ES 模块，无需构建 |

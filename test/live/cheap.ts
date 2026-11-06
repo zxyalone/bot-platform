@@ -4,4 +4,5 @@ export const CHEAPEST = {
   codex: "gpt-6-luna",
   grok: "grok-4.7-build-fast",
   antigravity: "gemini-3.8-flash",
+  dsh: "deepseek-account/deepseek-flash",
 } as const;

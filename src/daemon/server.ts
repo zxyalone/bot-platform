@@ -11,10 +11,11 @@ import { readQuotas, type QuotaReport } from "./quota.ts";
 import { refineRole, type RefineInput } from "./refine.ts";
 import { CHIEF_ROLE, SETTING_DEFAULTS, type AppSettings } from "./store.ts";
 import { isAbsolute, join } from "node:path";
-import { Engine, HttpError, STEERABLE } from "./engine.ts";
+import { Engine, HttpError, STEERABLE, UNGATED_AGENTS } from "./engine.ts";
 import { Memory, type MemoryScope } from "./git.ts";
 import { agentEnv } from "./adapters/process.ts";
 import type { Store } from "./store.ts";
+import { probeDsh } from "./adapters/acp.ts";
 import { MODELS, MODEL_ID, validModel, type AgentKind, type ApprovalDecision, type Bot, type Group, type RuntimeFactory } from "./types.ts";
 
 const MAX_BODY = 512 * 1024;
@@ -56,7 +57,7 @@ export function listedModels(out: string, agent: "grok" | "antigravity"): string
 }
 
 export async function agentStatus() {
-  const [cv, cl, xv, xl, gv, gl, av, al] = await Promise.all([exec("claude", ["--version"]), exec("claude", ["auth", "status"]), exec("codex", ["--version"]), exec("codex", ["login", "status"]), exec("grok", ["--version"]), exec("grok", ["models"]), exec("agy", ["--version"]), exec("agy", ["models"])]);
+  const [cv, cl, xv, xl, gv, gl, av, al, ds] = await Promise.all([exec("claude", ["--version"]), exec("claude", ["auth", "status"]), exec("codex", ["--version"]), exec("codex", ["login", "status"]), exec("grok", ["--version"]), exec("grok", ["models"]), exec("agy", ["--version"]), exec("agy", ["models"]), probeDsh()]);
   let claudeIn = false;
   try {
     claudeIn = JSON.parse(cl.out).loggedIn === true;
@@ -66,6 +67,8 @@ export async function agentStatus() {
     codex: { installed: xv.ok, loggedIn: xl.ok && /logged in/i.test(xl.out), version: xv.ok ? xv.out.trim().split(" ").pop() : null, models: MODELS.codex },
     grok: { installed: gv.ok, loggedIn: gl.ok && /logged in/i.test(gl.out), version: gv.ok ? gv.out.trim().split(" ")[1] : null, models: gl.ok ? listedModels(gl.out, "grok") : MODELS.grok },
     antigravity: { installed: av.ok, loggedIn: al.ok && /gemini|claude|gpt/i.test(al.out), version: av.ok ? av.out.trim() : null, models: al.ok ? listedModels(al.out, "antigravity") : MODELS.antigravity },
+    // Ready once dsh offers at least one model: a DeepSeek account login or a DeepSeek API key.
+    dsh: { installed: ds.installed, loggedIn: ds.models.length > 0, version: ds.version, models: ds.models.length ? ds.models : MODELS.dsh },
   };
 }
 
@@ -323,7 +326,7 @@ export function createApp(o: { reveal?: (path: string) => Promise<void>; store: 
       statusCache = null;
       return json(res, 200, { agents: await status(), workspace_templates: templatesFor((await status()) as AgentStatusMap) });
     }
-    if (m === "GET" && pathname === "/api/state") return json(res, 200, { workspaces: listWorkspaces(o.store), workspace_templates: templatesFor((await status()) as AgentStatusMap), steerable: STEERABLE, settings: o.store.settings(), bots: o.store.listBots().map(botView), groups: o.store.listGroups().map(groupView), agents: await status(), chief_default_role: CHIEF_ROLE });
+    if (m === "GET" && pathname === "/api/state") return json(res, 200, { workspaces: listWorkspaces(o.store), workspace_templates: templatesFor((await status()) as AgentStatusMap), steerable: STEERABLE, ungated: UNGATED_AGENTS, settings: o.store.settings(), bots: o.store.listBots().map(botView), groups: o.store.listGroups().map(groupView), agents: await status(), chief_default_role: CHIEF_ROLE });
     if (pathname === "/api/settings") {
       if (m === "GET") return json(res, 200, { settings: o.store.settings(), home: o.store.home });
       if (m === "PUT") {

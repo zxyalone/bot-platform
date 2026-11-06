@@ -1,4 +1,4 @@
-export type AgentKind = "claude" | "codex" | "grok" | "antigravity";
+export type AgentKind = "claude" | "codex" | "grok" | "antigravity" | "dsh";
 export type Effort = "low" | "medium" | "high";
 export type PermissionPreset = "ask" | "auto_edit" | "read_only";
 export type Route = "official" | "gateway";
@@ -114,6 +114,8 @@ export const MODELS: Record<AgentKind, string[]> = {
   codex: ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"],
   grok: ["grok-4.7", "grok-4.7-build-fast", "grok-4.6"],
   antigravity: ["gemini-4-argon", "gemini-3.8-flash"],
+  // DeepSeek Harness: "<provider>/<model>". deepseek-account is a DeepSeek account login, deepseek-official the DeepSeek API key.
+  dsh: ["deepseek-account/deepseek-v4-pro", "deepseek-account/deepseek-flash", "deepseek-official/deepseek-v4-pro", "deepseek-official/deepseek-flash", "deepseek-official/deepseek-v4-flash"],
 };
 
 // Any model the person's own CLI accepts. It becomes one argv entry, so it must not look like a flag.

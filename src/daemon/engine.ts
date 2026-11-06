@@ -23,6 +23,8 @@ export { HttpError };
 
 const MAX_BOTS = 12;
 export const STEERABLE: AgentKind[] = ["claude", "codex"];
+// Agents that act without asking the platform first, so approvals and read-only do not bind them.
+export const UNGATED_AGENTS: AgentKind[] = ["dsh"];
 const MAX_QUEUED = 10;
 // A conversation with one Bot has no per-round limit. Only the project's budget, if one is set, can stop it. Groups still have one.
 const NO_ROUND_LIMIT = 0;
@@ -1719,6 +1721,10 @@ export class Engine {
     if (refusal) return refuse(refusal, target.name);
 
     if (place.isolated && place.workspace) return refuse("isolated 和 workspace 只能选一个", target.name);
+    // dsh runs its own tools without asking the platform, so approvals cannot hold its writes back.
+    // A task for it goes to its own worktree when the folder allows one, where the person reviews before merging.
+    const autoIsolated = UNGATED_AGENTS.includes(target.agent as AgentKind) && mode === "task" && !place.isolated && !place.workspace;
+    if (autoIsolated) place = { ...place, isolated: true };
     let cwd = this.store.getConversation(l.convId)!.cwd;
     const callerCwd = cwd;
     if (place.workspace) {
@@ -1754,9 +1760,14 @@ export class Engine {
         this.artifacts.copyInto(root.convId, cwd);
         this.broadcast({ type: "worktrees", convId: root.convId });
       } catch (e) {
-        root.callCount--;
-        if (!queued) root.activeCalls--;
-        return refuse((e as Error).message, target.name);
+        if (!autoIsolated) {
+          root.callCount--;
+          if (!queued) root.activeCalls--;
+          return refuse((e as Error).message, target.name);
+        }
+        // Not a Git folder with a commit yet: it runs in place, as any task would.
+        child = this.store.findChild("call", l.convId, target.id, cwd);
+        if (child && child.agent !== target.agent) child = undefined;
       }
     }
     child ??= this.store.createChild("call", l.convId, target, cwd, `${l.bot.name} → ${target.name}`);

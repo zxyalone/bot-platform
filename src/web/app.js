@@ -12,7 +12,10 @@ import { mountProject } from "./project.js";
 import { mountArtifacts, previewArtifact } from "./artifacts.js";
 import { draftKey as keyFor, loadDrafts, saveDrafts } from "./drafts.js";
 
-const AGENT_LABEL = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", antigravity: "Antigravity" };
+const UNGATED_NOTE = "DeepSeek（dsh）自己执行工具，不经平台审批：权限设置和只读对它无效，它能直接改文件、运行命令。派给它的后台任务默认放进工作树，合并前请看改动。";
+const ungated = (agent) => (state.ungated ?? []).includes(agent);
+
+const AGENT_LABEL = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", antigravity: "Antigravity", dsh: "DeepSeek" };
 const EFFORT_LABEL = { low: "低", medium: "中", high: "高" };
 const PERMISSION_LABEL = { ask: "每次询问", auto_edit: "自动改文件（工作目录）", read_only: "只读（不能改文件）" };
 const ROUTE_LABEL = { official: "官方直连", gateway: "经本机网关（Magpie）" };
@@ -118,7 +121,12 @@ const currentConv = () => currentEntity()?.conversations.find((c) => c.id === st
 const botById = (id) => state.bots.find((b) => b.id === id);
 const groupMembers = (g) => g.members.map(botById).filter(Boolean);
 const titleCase = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const DSH_PROVIDER = { "deepseek-account": "账号", "deepseek-official": "API" };
+
 function modelLabel(m) {
+  // dsh models carry the provider: deepseek-account/deepseek-v4-pro → "V4 Pro · 账号".
+  const dsh = m.match(/^(deepseek-[a-z]+)\/deepseek-(.+)$/);
+  if (dsh) return `${dsh[2].split("-").map((p) => (/^v\d/.test(p) ? p.toUpperCase() : titleCase(p))).join(" ")} · ${DSH_PROVIDER[dsh[1]] ?? dsh[1]}`;
   const claude = m.match(/^claude-([a-z]+)-(\d+)-(\d+)$/);
   if (claude) return `${titleCase(claude[1])} ${claude[2]}.${claude[3]}`;
   const gemini = m.match(/^gemini-([\d.]+)-([a-z]+)$/);
@@ -526,6 +534,7 @@ async function refreshAll() {
       state.workspaceId = s.workspaces.some((w) => w.id === saved) ? saved : "default";
     }
     state.steerable = s.steerable ?? [];
+    state.ungated = s.ungated ?? [];
     applyAppearance(s.settings);
     restartQuotaTimer();
     state.loadError = null;
@@ -1238,6 +1247,7 @@ const AGENT_SETUP = {
   codex: { install: "npm install -g @openai/codex", login: "codex login", note: "用 ChatGPT 账号登录" },
   grok: { install: null, login: "grok", note: "按 xAI 官网的说明安装 Grok CLI，再运行它登录" },
   antigravity: { install: null, login: "agy", note: "安装 Antigravity 后，运行 agy 登录 Google 账号" },
+  dsh: { install: null, login: "dsh web", note: "安装 DeepSeek Harness，在应用里登录 DeepSeek 账号，或填入 DeepSeek API key" },
 };
 
 function onboarding() {
@@ -1271,7 +1281,7 @@ function onboarding() {
           "div",
           { class: `setup-agent ${tone}` },
           h("div", { class: "setup-agent-head" }, h("strong", {}, AGENT_LABEL[a]), h("span", { class: `setup-state ${tone}` }, stateText)),
-          tone === "ok" ? h("p", { class: "muted small" }, `可用模型：${(s.models ?? []).map(modelLabel).join("、")}`) : h("div", { class: "setup-help" }, help.install && !s?.installed ? cmd(help.install) : null, cmd(help.login), h("p", { class: "muted small" }, help.note)),
+          tone === "ok" ? h("p", { class: "muted small" }, `可用模型：${(s.models ?? []).map(modelLabel).join("、")}${ungated(a) ? "。注意：它不经平台审批，改动请在工作树里审查" : ""}`) : h("div", { class: "setup-help" }, help.install && !s?.installed ? cmd(help.install) : null, cmd(help.login), h("p", { class: "muted small" }, help.note)),
         );
       }),
     ),
@@ -2359,7 +2369,8 @@ function renderDetails() {
       row("底层 agent", AGENT_LABEL[b.agent]),
       row("模型", b.model),
       row("强度", EFFORT_LABEL[b.effort]),
-      row("权限", PERMISSION_LABEL[b.permission]),
+      row("权限", ungated(b.agent) ? `${PERMISSION_LABEL[b.permission]}（对 dsh 无效）` : PERMISSION_LABEL[b.permission]),
+      ungated(b.agent) ? h("p", { class: "banner warning small" }, UNGATED_NOTE) : null,
       row("可调用", b.can_call === null ? "所有 Bot" : b.can_call.length ? b.can_call.map((id) => botById(id)?.name).filter(Boolean).join("、") : "无"),
       b.agent === "codex" ? row("路由", ROUTE_LABEL[b.route]) : null,
       h("div", { class: "kv stacked" }, h("dt", {}, "工作目录"), h("dd", { class: "path", title: b.cwd }, b.cwd)),
@@ -2403,7 +2414,13 @@ function openBotDialog(bot, proposal) {
     routeWrap.hidden = agentSel.value !== "codex";
   };
   agentSel.value = src?.agent ?? state.settings?.default_agent ?? "claude";
-  agentSel.addEventListener("change", () => fillModels());
+  const ungatedWarn = h("p", { class: "banner warning small", hidden: true }, UNGATED_NOTE);
+  const syncUngated = () => (ungatedWarn.hidden = !ungated(agentSel.value));
+  agentSel.addEventListener("change", () => {
+    fillModels();
+    syncUngated();
+  });
+  queueMicrotask(syncUngated);
   const form = h(
     "form",
     {
@@ -2465,6 +2482,7 @@ function openBotDialog(bot, proposal) {
       h("label", { class: "field", for: "f-permission" }, "权限", h("select", { id: "f-permission", name: "permission" }, Object.entries(PERMISSION_LABEL).map(([k, v]) => h("option", { value: k }, v)))),
     ),
     routeWrap,
+    ungatedWarn,
     bot ? h("label", { class: "field check-inline" }, h("input", { type: "checkbox", name: "paused", checked: bot.paused ? true : null }), "暂停（其他 Bot 不能调用它）") : null,
     !proposal && hereBots().some((x) => x.id !== bot?.id)
       ? h(

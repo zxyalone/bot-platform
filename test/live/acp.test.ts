@@ -1,4 +1,4 @@
-// Real Grok Build and Antigravity on their cheapest models, one pass: role, bus, auto-edit, resume and read-only.
+// Real Grok Build, Antigravity and DeepSeek (dsh) on their cheapest models, one pass: role, bus, auto-edit, resume and read-only.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -11,6 +11,7 @@ import { CHEAPEST } from "./cheap.ts";
 const CASES = [
   { agent: "grok", model: CHEAPEST.grok },
   { agent: "antigravity", model: CHEAPEST.antigravity },
+  { agent: "dsh", model: CHEAPEST.dsh },
 ];
 
 async function turn(t: any, botId: string, text: string, conversationId?: string) {
@@ -58,6 +59,13 @@ for (const c of CASES) {
     assert.deepEqual(b.errors, []);
     assert.match(readFileSync(join(cwd, "hello.txt"), "utf8"), /hello/);
 
+    if (c.agent === "dsh") {
+      // dsh acts without asking the platform, so read-only cannot be enforced; the platform says so instead.
+      assert.ok(existsSync(join(cwd, "hello.txt")));
+      delete process.env.BOT_ACP_TRACE;
+      t.close();
+      return;
+    }
     const ro = (await t.api("POST", "/api/bots", { ...base, name: "Reader", role: "", permission: "read_only", can_call: [] })).body;
     const e = await turn(t, ro.id, "在当前工作目录创建文件 ro.txt，内容是 hello。现在就用工具做，失败了就告诉我。");
     console.log(c.agent, "read-only turn:", JSON.stringify({ reply: e.reply.slice(0, 80), tools: e.tools, approvals: e.approvals }));

@@ -69,6 +69,12 @@ async function prompt(m) {
     await new Promise((res) => (cancel = res));
     return done("cancelled");
   }
+  if (text.includes("CONTEXT")) {
+    // Like dsh: no usage in the result, only how full the context is after each model request.
+    for (const used of [1000, 1400, 1500]) update(sessionId, { sessionUpdate: "usage_update", used, size: 1048576 });
+    say(sessionId, "ok");
+    return send({ id: m.id, result: { stopReason: "end_turn" } });
+  }
   if (text.includes("PREFIX")) {
     say(sessionId, "Created At: 2026\nCompleted At: 2026\n结果");
     return done();
@@ -84,7 +90,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (m.id !== undefined && !m.method) {
     waiting.get(m.id)?.(m.result);
     waiting.delete(m.id);
-  } else if (m.method === "initialize") send({ id: m.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
+  } else if (m.method === "initialize") send({ id: m.id, result: { protocolVersion: 1, agentCapabilities: process.env.FAKE_ACP_RESUME ? { sessionCapabilities: { resume: {} } } : { loadSession: true } } });
+  else if (m.method === "session/resume") send(m.params.sessionId === "missing" ? { id: m.id, error: { code: -32000, message: "no such session" } } : { id: m.id, result: {} });
+  else if (m.method === "session/set_config_option") send({ id: m.id, result: { configOptions: [] } });
   else if (m.method === "session/new") send({ id: m.id, result: { sessionId: "sess-new" } });
   else if (m.method === "session/load") {
     if (m.params.sessionId === "missing") return send({ id: m.id, error: { code: -32000, message: "no such session" } });
