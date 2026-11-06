@@ -2,8 +2,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export function agentEnv(): NodeJS.ProcessEnv {
+export function agentEnv(drop: string[] = []): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const k of drop) delete env[k];
   // Set when the daemon itself was launched from a Claude Code session.
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
@@ -27,8 +28,9 @@ export function spawnLines(
   cwd: string,
   onMessage: (msg: any) => void,
   onExit: (detail: { code: number | null; signal: string | null; error?: string }) => void,
+  dropEnv: string[] = [],
 ): LineProcess {
-  const child = spawn(command, args, { cwd, env: agentEnv(), stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(command, args, { cwd, env: agentEnv(dropEnv), stdio: ["pipe", "pipe", "pipe"] });
   let buf = "";
   let tail = "";
   let exited = false;

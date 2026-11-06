@@ -26,6 +26,26 @@ const toolDetail = (name: string, input: any): string => {
 
 const rememberKey = (name: string, input: any) => (name === "Bash" ? `Bash:${input?.command}` : name);
 
+export function claudeArgs(o: RuntimeOptions): string[] {
+  const args = [
+    "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+    "--permission-prompt-tool", "stdio", "--strict-mcp-config",
+    "--model", o.model, "--effort", o.effort,
+    "--permission-mode", o.permission === "auto_edit" ? "acceptEdits" : "default",
+  ];
+  // Measured with Claude Code 2.1.318: about 19k tokens of fixed context per request without these, 13k with them.
+  if (o.lean) args.push("--setting-sources", "project,local", "--disable-slash-commands", "--exclude-dynamic-system-prompt-sections");
+  if (o.systemPrompt) args.push("--append-system-prompt", o.systemPrompt);
+  if (o.sessionId) args.push("--resume", o.sessionId);
+  if (o.bus) {
+    args.push("--mcp-config", JSON.stringify({ mcpServers: { botbus: o.bus } }));
+    // Bus tools run without a prompt: the bus enforces its own limits, and it is the Bot's job to call them.
+    args.push("--allowedTools", o.bus.env.BUS_TOOLS.split(",").map((t) => `mcp__botbus__${t}`).join(","));
+  }
+  if (o.permission === "read_only") args.push("--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit,Bash");
+  return args;
+}
+
 export class ClaudeRuntime implements AgentRuntime {
   private proc: LineProcess | null = null;
   private readonly opts: RuntimeOptions;
@@ -38,6 +58,8 @@ export class ClaudeRuntime implements AgentRuntime {
   private interrupting = false;
   private stopping = false;
   private readonly ticked = new Set<string>();
+  private requests = 0;
+  private contextTokens = 0;
 
   constructor(opts: RuntimeOptions) {
     this.opts = opts;
@@ -45,20 +67,8 @@ export class ClaudeRuntime implements AgentRuntime {
 
   async start() {
     const o = this.opts;
-    const args = [
-      "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-      "--permission-prompt-tool", "stdio", "--strict-mcp-config",
-      "--model", o.model, "--effort", o.effort,
-      "--permission-mode", o.permission === "auto_edit" ? "acceptEdits" : "default",
-    ];
-    if (o.systemPrompt) args.push("--append-system-prompt", o.systemPrompt);
-    if (o.sessionId) args.push("--resume", o.sessionId);
-    if (o.bus) {
-      args.push("--mcp-config", JSON.stringify({ mcpServers: { botbus: o.bus } }));
-      // Bus tools run without a prompt: the bus enforces its own limits, and it is the Bot's job to call them.
-      args.push("--allowedTools", o.bus.env.BUS_TOOLS.split(",").map((t) => `mcp__botbus__${t}`).join(","));
-    }
-    if (o.permission === "read_only") args.push("--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit,Bash");
+    const args = claudeArgs(o);
+    // An inherited API key would move a subscription login onto pay-as-you-go billing.
     this.proc = spawnLines("claude", args, o.cwd, (m) => this.onMessage(m), (d) => {
       const tail = this.proc?.stderrTail() || d.error || "";
       if (this.inTurn && !this.stopping) {
@@ -66,11 +76,13 @@ export class ClaudeRuntime implements AgentRuntime {
       }
       this.inTurn = false;
       o.onEvent({ type: "exit", error: this.stopping ? undefined : tail || undefined });
-    });
+    }, ["ANTHROPIC_API_KEY"]);
   }
 
   async send(text: string) {
     this.inTurn = true;
+    this.requests = 0;
+    this.contextTokens = 0;
     this.interrupting = false;
     this.proc?.write({ type: "user", message: { role: "user", content: text } });
   }
@@ -149,6 +161,8 @@ export class ClaudeRuntime implements AgentRuntime {
       if (id && !this.ticked.has(id) && m.message?.usage) {
         this.ticked.add(id);
         const u = m.message.usage;
+        this.requests++;
+        this.contextTokens = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
         emit({ type: "usage_tick", tokens: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0) });
       }
       for (const [i, block] of (m.message?.content ?? []).entries()) {
@@ -178,6 +192,8 @@ export class ClaudeRuntime implements AgentRuntime {
         cachedTokens: u.cache_read_input_tokens ?? 0,
         outputTokens: u.output_tokens ?? 0,
         costTotalUsd: m.total_cost_usd,
+        requests: this.requests || undefined,
+        contextTokens: this.contextTokens || undefined,
       });
       const wasInterrupting = this.interrupting;
       this.inTurn = false;

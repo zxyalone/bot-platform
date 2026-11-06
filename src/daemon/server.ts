@@ -81,6 +81,8 @@ const SETTING_RULES: Record<string, string[] | [number, number] | "boolean"> = {
   max_active: [1, 10],
   max_global_active: [1, 50],
   notify_enabled: "boolean",
+  claude_personal_config: "boolean",
+  rotate_context_tokens: [0, 2_000_000],
   task_timeout_minutes: [0, 1440],
   low_quota: [1, 90],
   quota_refresh_minutes: [1, 120],

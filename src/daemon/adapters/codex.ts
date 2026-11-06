@@ -22,7 +22,7 @@ export class CodexRuntime implements AgentRuntime {
   private interrupting = false;
   private stopping = false;
   private sessionAnnounced = false;
-  private usage = { inputTokens: 0, cachedTokens: 0, outputTokens: 0 };
+  private usage = { inputTokens: 0, cachedTokens: 0, outputTokens: 0, requests: 0, contextTokens: 0 };
 
   constructor(opts: RuntimeOptions) {
     this.opts = opts;
@@ -64,7 +64,7 @@ export class CodexRuntime implements AgentRuntime {
   async send(text: string) {
     this.inTurn = true;
     this.interrupting = false;
-    this.usage = { inputTokens: 0, cachedTokens: 0, outputTokens: 0 };
+    this.usage = { inputTokens: 0, cachedTokens: 0, outputTokens: 0, requests: 0, contextTokens: 0 };
     try {
       const r = await this.call("turn/start", { threadId: this.threadId, input: [{ type: "text", text }], effort: this.opts.effort, model: this.opts.model });
       this.turnId = r?.turn?.id ?? this.turnId;
@@ -191,6 +191,8 @@ export class CodexRuntime implements AgentRuntime {
           this.usage.inputTokens += l.inputTokens ?? 0;
           this.usage.cachedTokens += l.cachedInputTokens ?? 0;
           this.usage.outputTokens += l.outputTokens ?? 0;
+          this.usage.requests++;
+          this.usage.contextTokens = l.inputTokens ?? 0;
           this.opts.onEvent({ type: "usage_tick", tokens: (l.inputTokens ?? 0) - (l.cachedInputTokens ?? 0) + (l.outputTokens ?? 0) });
         }
         return;

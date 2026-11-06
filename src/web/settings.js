@@ -109,6 +109,11 @@ export function mountSettings(root, ctx) {
         row("同时进行", "超过时新的调用会被拒绝", number("max_active", "同时进行的调用", 1, 10)),
         row("任务超时", "分钟。后台任务运行超过这么久就停止，Bot 只能设得更短，等你审批的时间不算。0 表示不限", number("task_timeout_minutes", "任务超时分钟数", 0, 1440)),
       ),
+      group(
+        "节省用量",
+        row("长会话换新", "一个 Bot 单次请求的上下文超过这么多 tokens 后，下一轮开新会话，只带近期对话。Grok 和 Antigravity 不报告上下文大小，不受影响。0 表示不换", number("rotate_context_tokens", "长会话换新阈值", 0, 2000000, 10000)),
+        row("Claude 用我的个人配置", "打开后 Claude Bot 会加载你自己的 Claude Code 设置、插件和技能，每次请求约多带 6k tokens。项目里的 CLAUDE.md 和设置始终会加载", toggle("claude_personal_config", "Claude 用我的个人配置")),
+      ),
       group("全局", row("同时运行的 agent", "所有对话加起来。满了之后新消息会被拒绝，排队的消息和后台任务继续等。主 Bot 等后台任务时不占调用名额，所以峰值可能略高", number("max_global_active", "同时运行的 agent", 1, 50))),
       group(
         "通知",

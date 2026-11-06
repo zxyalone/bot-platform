@@ -15,6 +15,7 @@ const FLUSH_MS = 400;
 const INTERRUPT_GRACE_MS = 8000;
 const MAX_ANSWER = 30000;
 const MAX_TRANSCRIPT = 30000;
+const CARRYOVER_CHARS = 20000;
 const BUS_SHIM = join(dirname(fileURLToPath(import.meta.url)), "bus-mcp.mjs");
 
 export { HttpError };
@@ -159,7 +160,7 @@ interface Live {
   assistantItems: Map<string, { itemId: string; text: string; timer: NodeJS.Timeout | null }>;
   toolItems: Map<string, string>;
   approvals: Map<string, string>;
-  usage: { inputTokens: number; cachedTokens: number; outputTokens: number; costUsd: number | null } | null;
+  usage: { inputTokens: number; cachedTokens: number; outputTokens: number; costUsd: number | null; requests?: number; contextTokens?: number } | null;
   interruptTimer: NodeJS.Timeout | null;
   files: Set<string>;
   // Set after a steer: a message that arrived just too late is answered after the turn it was meant for.
@@ -1062,10 +1063,13 @@ export class Engine {
           if (this.live.get(sessionConvId) !== live) throw new Error("进程启动后立刻退出了");
           // Starting can take a while, and the person may have cancelled this meanwhile. Nothing has been sent yet, so nothing needs undoing.
           if (stopped()) return resolve({ status: "interrupted", text: "", tokens: 0 });
-          const note = this.projects.updateNote(sessionConvId, this.projects.promptSection(ctx.root.cwd), Boolean(this.store.getConversation(sessionConvId)?.session_id));
+          const fresh = this.store.getConversation(sessionConvId);
+          const note = this.projects.updateNote(sessionConvId, this.projects.promptSection(ctx.root.cwd), Boolean(fresh?.session_id));
+          const carry = !fresh?.session_id && fresh?.carryover ? `${fresh.carryover}\n\n---\n\n` : "";
+          if (fresh?.carryover) this.store.updateConversation(sessionConvId, { carryover: null });
           Object.assign(live, { turnId, turnStarted: Date.now(), lastUsed: Date.now(), usage: null, ctx, resolve, ticks: 0, turnTokens: 0, texts: [], files: new Set(), lateConv: null });
           ctx.root.active.add(live);
-          await live.runtime.send(note + prompt);
+          await live.runtime.send(carry + note + prompt);
         } catch (e) {
           const message = `无法启动 ${bot.agent}：${(e as Error).message}`;
           this.dropRuntime(sessionConvId);
@@ -1077,7 +1081,7 @@ export class Engine {
   }
 
   private configKey(bot: Bot, extra: string, research: boolean) {
-    return JSON.stringify([bot.model, bot.effort, bot.permission, bot.role, bot.name, bot.can_call, extra, this.memoryEpoch, research]);
+    return JSON.stringify([bot.model, bot.effort, bot.permission, bot.role, bot.name, bot.can_call, extra, this.memoryEpoch, research, this.store.settings().claude_personal_config]);
   }
 
   private researchEnabled(rootConvId: string) {
@@ -1129,6 +1133,7 @@ export class Engine {
       cwd: conv.cwd,
       systemPrompt: [bot.role, extraSystem, brief, memory].filter(Boolean).join("\n\n"),
       sessionId: conv.session_id,
+      lean: !this.store.settings().claude_personal_config,
       bus: { command: process.execPath, args: [BUS_SHIM], env: { BUS_URL: this.busUrl(), BUS_TOKEN: busToken, BUS_TOOLS: tools.join(",") } },
       onEvent: (ev) => {
         if (this.live.get(convId) === live) this.onEvent(live, ev);
@@ -1138,6 +1143,24 @@ export class Engine {
     this.busTokens.set(busToken, live);
     await live.runtime.start();
     return live;
+  }
+
+  // Every request in a turn rereads the whole session, so a long session makes each later turn cost more.
+  // The next turn starts a new one, carrying the recent conversation instead of the full history.
+  private retireSession(l: Live, displayConvId: string, contextTokens: number) {
+    const source = this.store.listItems(l.convId).some((i) => i.type === "user") ? l.convId : displayConvId;
+    const lines: string[] = [];
+    for (const i of this.store.listItems(source)) {
+      const by = i.data.bot as { name: string } | undefined;
+      if (i.type === "user" && i.data.text) lines.push(`[用户]：${i.data.text}`);
+      else if (i.type === "assistant" && i.data.text) lines.push(`[${by?.name ?? l.bot.name}]：${i.data.text}`);
+    }
+    const text = lines.join("\n\n");
+    const recent = text.length > CARRYOVER_CHARS ? `（更早的内容已省略）\n${text.slice(-CARRYOVER_CHARS)}` : text;
+    const carryover = `[平台通知，不是用户发的]：之前的会话上下文已经很长（约 ${Math.round(contextTokens / 1000)}k tokens），为节省用量，平台为你开了一个新会话。下面是之前对话的近期记录。需要细节时请重新读相关文件，不要凭记忆猜。\n\n${recent}`;
+    this.dropRuntime(l.convId);
+    this.store.updateConversation(l.convId, { session_id: null, cost_total: 0, carryover });
+    this.addItem(displayConvId, null, "notice", "done", { text: `${l.bot.name} 的上下文到了约 ${Math.round(contextTokens / 1000)}k tokens，下一轮会开新会话并带上近期对话，以免每一步都重读全部历史。可以在 设置 → 运行限制 里调整或关闭。`, local: true });
   }
 
   private dropRuntime(convId: string) {
@@ -1273,7 +1296,7 @@ export class Engine {
           costUsd = Math.max(0, ev.costTotalUsd >= conv.cost_total ? ev.costTotalUsd - conv.cost_total : ev.costTotalUsd);
           this.store.updateConversation(l.convId, { cost_total: ev.costTotalUsd });
         }
-        l.usage = { inputTokens: ev.inputTokens, cachedTokens: ev.cachedTokens, outputTokens: ev.outputTokens, costUsd };
+        l.usage = { inputTokens: ev.inputTokens, cachedTokens: ev.cachedTokens, outputTokens: ev.outputTokens, costUsd, requests: ev.requests, contextTokens: ev.contextTokens };
         if (unknown) {
           l.turnTokens = l.ticks;
           return;
@@ -1319,6 +1342,8 @@ export class Engine {
         l.resolve = null;
         l.ctx = null;
         resolve?.({ status: ev.status, text: l.texts.at(-1) ?? "", error: ev.error, tokens: l.turnTokens });
+        const limit = this.store.settings().rotate_context_tokens;
+        if (limit && ev.status === "completed" && (l.usage?.contextTokens ?? 0) >= limit) this.retireSession(l, ctx.displayConvId, l.usage!.contextTokens!);
         return;
       }
       case "exit": {

@@ -48,6 +48,8 @@ export interface Conversation {
   route: Route;
   cwd: string;
   session_id: string | null;
+  // Set when an oversized session was retired; the next turn opens with it.
+  carryover: string | null;
   status: "idle" | "running";
   cost_total: number;
   archived: number;
@@ -76,7 +78,7 @@ export type AgentEvent =
   | { type: "approval"; requestId: string; title: string; detail: string; canRemember: boolean }
   | { type: "approval_cancelled"; requestId: string }
   | { type: "usage_tick"; tokens: number }
-  | { type: "usage"; inputTokens: number; cachedTokens: number; outputTokens: number; costTotalUsd?: number }
+  | { type: "usage"; inputTokens: number; cachedTokens: number; outputTokens: number; costTotalUsd?: number; requests?: number; contextTokens?: number }
   | { type: "turn_end"; status: TurnStatus; error?: string }
   | { type: "exit"; error?: string };
 
@@ -89,6 +91,8 @@ export interface RuntimeOptions {
   cwd: string;
   systemPrompt: string;
   sessionId: string | null;
+  // Claude only: leave out the person's own Claude Code settings, plugins and skills.
+  lean?: boolean;
   bus?: { command: string; args: string[]; env: Record<string, string> };
   onEvent: (event: AgentEvent) => void;
 }

@@ -7,7 +7,7 @@ import { agentEnv, clip, spawnLines, type LineProcess } from "./process.ts";
 const RPC_TIMEOUT_MS = 60000;
 const SAFE_KINDS = ["read", "search", "think", "fetch"];
 
-export type AcpLaunch = { command: string; args: string[]; modelId?: string; usage?: (sessionId: string) => Promise<UsageNumbers | null> };
+export type AcpLaunch = { command: string; args: string[]; modelId?: string; inputExcludesCached?: boolean; usage?: (sessionId: string) => Promise<UsageNumbers | null> };
 type UsageNumbers = { inputTokens: number; cachedTokens: number; outputTokens: number };
 
 // Grok's ACP mode does not report usage, but its CLI records every turn.
@@ -38,7 +38,8 @@ function realPath(p: string) {
 export function acpLaunch(o: RuntimeOptions): AcpLaunch {
   if ((o.agent as AgentKind) === "grok") return { command: "grok", args: ["agent", "-m", o.model, "--reasoning-effort", o.effort, "stdio"], usage: grokUsage };
   // Antigravity encodes the effort in the model id.
-  return { command: "agy", args: ["acp"], modelId: `${o.model}-${o.effort}` };
+  // Antigravity counts cache reads apart from inputTokens, unlike Claude, Codex and Grok.
+  return { command: "agy", args: ["acp"], modelId: `${o.model}-${o.effort}`, inputExcludesCached: true };
 }
 
 // Only agents that state a tool's kind can say that it edits files or runs a command.
@@ -128,7 +129,7 @@ export class AcpRuntime implements AgentRuntime {
     }
     this.closeSegment();
     const u = result?.usage;
-    const usage = u ? { inputTokens: u.inputTokens ?? 0, cachedTokens: u.cachedReadTokens ?? 0, outputTokens: u.outputTokens ?? 0 } : await this.launch.usage?.(this.sessionId!).catch(() => null);
+    const usage = u ? { inputTokens: (u.inputTokens ?? 0) + (this.launch.inputExcludesCached ? (u.cachedReadTokens ?? 0) : 0), cachedTokens: u.cachedReadTokens ?? 0, outputTokens: u.outputTokens ?? 0 } : await this.launch.usage?.(this.sessionId!).catch(() => null);
     if (usage) emit({ type: "usage", ...usage });
     const wasInterrupting = this.interrupting;
     this.inTurn = false;

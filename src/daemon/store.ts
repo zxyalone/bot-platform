@@ -71,6 +71,8 @@ export const SETTING_DEFAULTS = {
   max_active: 3,
   max_global_active: 8,
   notify_enabled: true,
+  claude_personal_config: false,
+  rotate_context_tokens: 150000,
   task_timeout_minutes: 30,
   low_quota: 20,
   quota_refresh_minutes: 2,
@@ -174,11 +176,15 @@ export class Store {
     if (!has("bots", "can_call")) this.db.exec("ALTER TABLE bots ADD COLUMN can_call TEXT");
     if (!has("bots", "is_chief")) this.db.exec("ALTER TABLE bots ADD COLUMN is_chief INTEGER NOT NULL DEFAULT 0");
     if (!has("bots", "paused")) this.db.exec("ALTER TABLE bots ADD COLUMN paused INTEGER NOT NULL DEFAULT 0");
+    if (!has("usage_log", "requests")) {
+      this.db.exec("ALTER TABLE usage_log ADD COLUMN requests INTEGER; ALTER TABLE usage_log ADD COLUMN context_tokens INTEGER");
+      // Antigravity turns were logged with cache reads left out of the input, so more was cached than was read.
+      this.db.exec("UPDATE usage_log SET input_tokens = input_tokens + cached_tokens WHERE cached_tokens > input_tokens AND bot_id IN (SELECT id FROM bots WHERE agent='antigravity')");
+    }
     for (const [c, type] of [["reason", "TEXT"], ["chain", "TEXT"], ["depends_on", "TEXT"], ["retry_of", "TEXT"], ["timeout_ms", "INTEGER"]]) if (!has("calls", c)) this.db.exec(`ALTER TABLE calls ADD COLUMN ${c} ${type}`);
     this.db.exec("CREATE INDEX IF NOT EXISTS calls_task ON calls(root_conv_id, mode, created_at); CREATE INDEX IF NOT EXISTS calls_retry ON calls(retry_of);");
-    if (has("conversations", "kind")) return;
     // bot_id must become nullable for group conversations, which SQLite can only do by rebuilding the table.
-    this.db.exec(`
+    if (!has("conversations", "kind")) this.db.exec(`
       PRAGMA foreign_keys=OFF;
       BEGIN;
       CREATE TABLE conversations_new (
@@ -195,6 +201,7 @@ export class Store {
       COMMIT;
       PRAGMA foreign_keys=ON;
     `);
+    if (!has("conversations", "carryover")) this.db.exec("ALTER TABLE conversations ADD COLUMN carryover TEXT");
   }
 
   defaultCwd(botId: string) {
@@ -432,9 +439,9 @@ export class Store {
     return this.db.prepare("SELECT * FROM calls WHERE root_turn_id=? ORDER BY created_at, rowid").all(rootTurnId) as Row[];
   }
 
-  updateConversation(id: string, patch: Partial<Pick<Conversation, "title" | "session_id" | "status" | "cost_total" | "archived" | "last_seq">>) {
+  updateConversation(id: string, patch: Partial<Pick<Conversation, "title" | "session_id" | "status" | "cost_total" | "archived" | "last_seq" | "carryover">>) {
     for (const [k, v] of Object.entries(patch)) {
-      if (!["title", "session_id", "status", "cost_total", "archived", "last_seq"].includes(k)) throw new Error(`bad field ${k}`);
+      if (!["title", "session_id", "status", "cost_total", "archived", "last_seq", "carryover"].includes(k)) throw new Error(`bad field ${k}`);
       this.db.prepare(`UPDATE conversations SET ${k}=?, updated_at=? WHERE id=?`).run(v as string, Date.now(), id);
     }
   }
@@ -481,15 +488,15 @@ export class Store {
     return this.getItem(id)!;
   }
 
-  logUsage(u: { turnId: string; convId: string; botId: string; inputTokens: number; cachedTokens: number; outputTokens: number; costUsd: number | null }) {
+  logUsage(u: { turnId: string; convId: string; botId: string; inputTokens: number; cachedTokens: number; outputTokens: number; costUsd: number | null; requests?: number; contextTokens?: number }) {
     this.db
-      .prepare("INSERT OR REPLACE INTO usage_log (turn_id,conv_id,bot_id,input_tokens,cached_tokens,output_tokens,cost_usd,created_at) VALUES (?,?,?,?,?,?,?,?)")
-      .run(u.turnId, u.convId, u.botId, u.inputTokens, u.cachedTokens, u.outputTokens, u.costUsd, Date.now());
+      .prepare("INSERT OR REPLACE INTO usage_log (turn_id,conv_id,bot_id,input_tokens,cached_tokens,output_tokens,cost_usd,created_at,requests,context_tokens) VALUES (?,?,?,?,?,?,?,?,?,?)")
+      .run(u.turnId, u.convId, u.botId, u.inputTokens, u.cachedTokens, u.outputTokens, u.costUsd, Date.now(), u.requests ?? null, u.contextTokens ?? null);
   }
 
   botUsage(botId: string) {
     return this.db
-      .prepare("SELECT COUNT(*) turns, COALESCE(SUM(input_tokens),0) input_tokens, COALESCE(SUM(cached_tokens),0) cached_tokens, COALESCE(SUM(output_tokens),0) output_tokens, SUM(cost_usd) cost_usd FROM usage_log WHERE bot_id=?")
+      .prepare("SELECT COUNT(*) turns, COALESCE(SUM(input_tokens),0) input_tokens, COALESCE(SUM(cached_tokens),0) cached_tokens, COALESCE(SUM(output_tokens),0) output_tokens, SUM(cost_usd) cost_usd, AVG(requests) avg_requests, MAX(context_tokens) max_context FROM usage_log WHERE bot_id=?")
       .get(botId) as Row;
   }
 

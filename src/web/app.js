@@ -1874,6 +1874,8 @@ function itemNode(item) {
       if (item.status === "interrupted") parts.push("已停止");
       if (d.ms) parts.push(`${(d.ms / 1000).toFixed(1)} 秒`);
       if (d.inputTokens || d.outputTokens) parts.push(`输入 ${compact(d.inputTokens)} · 输出 ${compact(d.outputTokens)}`);
+      if (d.requests) parts.push(`${d.requests} 次请求`);
+      if (d.contextTokens) parts.push(`上下文 ${compact(d.contextTokens)}`);
       if (typeof d.costUsd === "number") parts.push(`估算 $${d.costUsd.toFixed(3)}`);
       return parts.length ? h("div", { ...attrs, class: "turn-summary" }, parts.join(" · ")) : null;
     }
@@ -2284,7 +2286,7 @@ function renderDetails() {
     ...moduleSection(b),
     ...traceSection(),
     h("h2", { class: "section" }, "累计用量"),
-    h("dl", {}, row("轮数", String(u.turns ?? 0)), row("输入", compact(u.input_tokens)), row("其中缓存", compact(u.cached_tokens)), row("输出", compact(u.output_tokens)), typeof u.cost_usd === "number" ? row("估算费用", `$${u.cost_usd.toFixed(3)}`) : null),
+    h("dl", {}, row("轮数", String(u.turns ?? 0)), row("输入", compact(u.input_tokens)), row("其中缓存", compact(u.cached_tokens)), row("输出", compact(u.output_tokens)), u.avg_requests ? row("每轮请求", u.avg_requests.toFixed(1)) : null, u.max_context ? row("最大上下文", compact(u.max_context)) : null, typeof u.cost_usd === "number" ? row("估算费用", `$${u.cost_usd.toFixed(3)}`) : null),
     h("p", { class: "muted small" }, "估算费用由 agent 上报。使用订阅时不一定等于实际扣费。"),
   );
 }
