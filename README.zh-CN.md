@@ -105,7 +105,7 @@ Bot Platform 把你电脑上的 agent 命令行变成一支**看得见、管得�
 ### Mac App
 
 ```bash
-git clone https://github.com/zxyalone/multi-agent.git && cd multi-agent
+git clone https://github.com/zxyalone/bot-platform.git && cd bot-platform
 macos/build.sh --release        # 生成 dist/release/Bot Platform.app 和通用 .dmg
 ```
 
@@ -116,7 +116,7 @@ macos/build.sh --release        # 生成 dist/release/Bot Platform.app 和通用
 ### 从源码运行
 
 ```bash
-git clone https://github.com/zxyalone/multi-agent.git && cd multi-agent
+git clone https://github.com/zxyalone/bot-platform.git && cd bot-platform
 npm start                       # 打开 http://127.0.0.1:4317
 ```
 

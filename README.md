@@ -105,7 +105,7 @@ The first screen detects which agent CLIs are installed and logged in, and which
 ### Mac app
 
 ```bash
-git clone https://github.com/zxyalone/multi-agent.git && cd multi-agent
+git clone https://github.com/zxyalone/bot-platform.git && cd bot-platform
 macos/build.sh --release        # → dist/release/Bot Platform.app and a universal .dmg
 ```
 
@@ -116,7 +116,7 @@ The release build bundles its own Node and keeps your data in `~/Library/Applica
 ### From source
 
 ```bash
-git clone https://github.com/zxyalone/multi-agent.git && cd multi-agent
+git clone https://github.com/zxyalone/bot-platform.git && cd bot-platform
 npm start                       # → http://127.0.0.1:4317
 ```
 
